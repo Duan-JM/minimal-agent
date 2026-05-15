@@ -1,0 +1,23 @@
+services:
+  sensenova-u1:
+    image: vllm/vllm-omni:v0.18.0
+    container_name: sensenova-u1
+    restart: unless-stopped
+    ipc: host
+    gpus: all
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    command:
+      - --model
+      - ${SENSENOVA_U1_MODEL:-sensenova/SenseNova-U1-8B-MoT}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - ${TENSOR_PARALLEL_SIZE:-1}
