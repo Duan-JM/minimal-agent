@@ -9,6 +9,10 @@ rest of the project uses:
   by ``chat_id`` (used by the one-shot ``run`` CLI).
 - :func:`download_message_resource` — download an image attached to a
   received message.
+- :func:`get_message` — fetch a single message by id (used to resolve
+  quoted-message images).
+- :func:`list_chat_messages` — fetch the recent message history of a chat
+  (used by the bot to build conversation context).
 - :func:`upload_image` — upload an image to Feishu, returning the
   ``image_key`` to be referenced in subsequent messages.
 
@@ -32,6 +36,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequestBody,
     GetMessageRequest,
     GetMessageResourceRequest,
+    ListMessageRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -217,6 +222,51 @@ def download_message_resource(message_id: str, file_key: str, *, type_: str = "i
             resp.file.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def list_chat_messages(
+    chat_id: str,
+    *,
+    count: int = 20,
+    start_time_seconds: Optional[int] = None,
+    sort_desc: bool = True,
+) -> list:
+    """Fetch the most recent messages in ``chat_id`` (newest first by default).
+
+    Wraps ``im.v1.message.list``. ``start_time_seconds`` filters by message
+    create time (Unix seconds). When ``sort_desc=True`` (the default) the
+    Feishu API returns newest-first; the returned list is then reversed
+    in-place so callers receive an *oldest → newest* sequence, which is
+    convenient for building chat-completion conversation history.
+
+    Used by the bot to surface conversation context when the user @-mentions
+    the bot (group) or DMs it (p2p). Required scope: ``im:message:readonly``
+    (or ``im:message``).
+
+    Raises :class:`FeishuError` on API failure. Callers should catch and
+    degrade gracefully — a context-load failure must never break the
+    primary reply path.
+    """
+    if not chat_id:
+        raise FeishuError("list_chat_messages: chat_id is required")
+    page_size = max(1, min(int(count), 50))  # Feishu caps page_size at 50.
+    builder = (
+        ListMessageRequest.builder()
+        .container_id_type("chat")
+        .container_id(chat_id)
+        .page_size(page_size)
+        .sort_type("ByCreateTimeDesc" if sort_desc else "ByCreateTimeAsc")
+    )
+    if start_time_seconds is not None and start_time_seconds > 0:
+        builder = builder.start_time(str(int(start_time_seconds)))
+    req = builder.build()
+    resp = get_client().im.v1.message.list(req)
+    _check(resp, "message.list")
+    items = getattr(resp.data, "items", None) if resp.data is not None else None
+    items = list(items or [])
+    if sort_desc:
+        items.reverse()  # oldest → newest for downstream conversation building.
+    return items
 
 
 def get_message(message_id: str):

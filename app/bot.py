@@ -7,7 +7,11 @@ This module wires up the official ``lark-oapi`` SDK so that the bot:
 3. Dedups by ``event_id`` (LRU) to defend against reconnect-redelivery.
 4. Offloads slow LLM/image work to a bounded thread pool so the SDK's asyncio
    receive loop stays responsive.
-5. Replies via the IM API through helpers in :mod:`app.feishu`.
+5. Optionally loads recent chat history (``im.v1.message.list``) and passes
+   it to the LLM as conversation context. Only triggered in P2P chats and
+   when @-mentioned in groups. Historical image attachments are included
+   only when ``T2T_MULTIMODAL=1``; otherwise a WARNING is logged.
+6. Replies via the IM API through helpers in :mod:`app.feishu`.
 
 The handler is deliberately small and defensive — on any worker exception it
 attempts a best-effort short error reply so the user isn't left hanging.
@@ -24,10 +28,33 @@ from typing import Optional
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
-from . import agent, feishu
+from . import _messages, agent, feishu, history as history_mod
 
 
 DEFAULT_RESPOND_MODE = "all"  # Feishu only delivers @-mentioned msgs in groups by default.
+
+# History-context defaults (overridable via env). Kept here so test code
+# and ``_build_bot_from_env`` agree.
+DEFAULT_HISTORY_COUNT = 20
+DEFAULT_HISTORY_WINDOW_MINUTES = 60
+DEFAULT_HISTORY_MAX_IMAGES = 3
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -60,80 +87,14 @@ class LRUSet:
 # Message parsing
 # ---------------------------------------------------------------------------
 
-MENTION_PLACEHOLDER_PREFIX = "@_user_"
-
-
-def _parse_message_content(msg_type: Optional[str], content: Optional[str]) -> tuple[str, list[str]]:
-    """Parse a Feishu message ``(message_type, content)`` pair.
-
-    Supports ``text``, ``image``, and ``post`` (rich text with embedded
-    images). Returns empty strings/lists for unsupported types or unparseable
-    content. The same shape is produced by ``EventMessage`` (live event) and
-    by ``Message.body`` (when we fetch a *quoted* message via
-    ``client.im.v1.message.get``), so this helper is used in both code paths.
-    """
-    if not content:
-        return "", []
-    try:
-        data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
-        return "", []
-
-    if msg_type == "text":
-        return (data.get("text") or "").strip(), []
-
-    if msg_type == "image":
-        key = data.get("image_key") or ""
-        return "", [key] if key else []
-
-    if msg_type == "post":
-        text_parts: list[str] = []
-        image_keys: list[str] = []
-        nodes = data.get("content") or []
-        for line in nodes:
-            for node in line or []:
-                tag = node.get("tag")
-                if tag == "text":
-                    t = node.get("text") or ""
-                    if t:
-                        text_parts.append(t)
-                elif tag == "img" or tag == "image":
-                    k = node.get("image_key") or ""
-                    if k:
-                        image_keys.append(k)
-        return " ".join(text_parts).strip(), image_keys
-
-    return "", []
-
-
-def _parse_content(message) -> tuple[str, list[str]]:
-    """Convenience wrapper for live ``EventMessage`` objects."""
-    return _parse_message_content(message.message_type, message.content)
-
-
-def _parse_quoted_message(msg) -> tuple[str, list[str]]:
-    """Convenience wrapper for ``Message`` objects returned by ``message.get``.
-
-    The shape differs slightly from the live event: the JSON content is
-    nested under ``msg.body.content`` and the type field is ``msg_type``
-    rather than ``message_type``.
-    """
-    body = getattr(msg, "body", None)
-    content = getattr(body, "content", None) if body is not None else None
-    return _parse_message_content(getattr(msg, "msg_type", None), content)
-
-
-def _strip_mentions(text: str, mentions) -> str:
-    """Replace ``@_user_N`` placeholders so they don't pollute the prompt."""
-    if not text or not mentions:
-        return text
-    cleaned = text
-    for m in mentions:
-        key = getattr(m, "key", None)
-        if key and key.startswith(MENTION_PLACEHOLDER_PREFIX):
-            cleaned = cleaned.replace(key, "")
-    # Tidy up consecutive whitespace.
-    return " ".join(cleaned.split()).strip()
+# Re-exports kept for backwards compatibility with existing tests and
+# downstream callers. The implementations live in :mod:`app._messages`
+# to avoid an ``app.bot`` ⇄ ``app.history`` import cycle.
+MENTION_PLACEHOLDER_PREFIX = _messages.MENTION_PLACEHOLDER_PREFIX
+_parse_message_content = _messages.parse_message_content
+_parse_content = _messages.parse_event_message
+_parse_quoted_message = _messages.parse_fetched_message
+_strip_mentions = _messages.strip_mentions
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +112,11 @@ class Bot:
         worker_threads: int = 4,
         dedup_capacity: int = 1024,
         log_level: Optional[lark.LogLevel] = None,
+        history_enabled: bool = True,
+        history_count: int = DEFAULT_HISTORY_COUNT,
+        history_window_minutes: int = DEFAULT_HISTORY_WINDOW_MINUTES,
+        history_max_images: int = DEFAULT_HISTORY_MAX_IMAGES,
+        t2t_multimodal: bool = False,
     ) -> None:
         self.respond_mode = respond_mode
         self.bot_open_id = bot_open_id
@@ -160,6 +126,12 @@ class Bot:
         )
         self._dedup = LRUSet(capacity=dedup_capacity)
         self._log_level = log_level or lark.LogLevel.INFO
+        # History-context settings (see README + AGENTS.md for env vars).
+        self.history_enabled = history_enabled
+        self.history_count = max(1, int(history_count))
+        self.history_window_minutes = max(0, int(history_window_minutes))
+        self.history_max_images = max(0, int(history_max_images))
+        self.t2t_multimodal = t2t_multimodal
 
     # -- public API ---------------------------------------------------------
 
@@ -238,6 +210,13 @@ class Bot:
         if not self._should_respond(message):
             return
 
+        # Capture extra context for history loading (sender, chat type,
+        # whether the bot was @-mentioned). Done here on the asyncio loop
+        # since the live ``EventMessage`` is cheap to inspect.
+        chat_type = getattr(message, "chat_type", None)
+        sender_open_id = self._extract_sender_open_id(sender)
+        is_mentioned = self._was_bot_mentioned(message)
+
         # Hand off to a worker thread so the asyncio loop stays free.
         self._executor.submit(
             self._process,
@@ -247,9 +226,29 @@ class Bot:
             text=text,
             image_keys=image_keys,
             parent_id=parent_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            is_mentioned=is_mentioned,
         )
 
     # -- mention gating -----------------------------------------------------
+
+    @staticmethod
+    def _extract_sender_open_id(sender) -> Optional[str]:
+        if sender is None:
+            return None
+        sid = getattr(sender, "sender_id", None)
+        return getattr(sid, "open_id", None) if sid is not None else None
+
+    def _was_bot_mentioned(self, message) -> bool:
+        if not self.bot_open_id:
+            return False
+        for m in (message.mentions or []):
+            mid = getattr(m, "id", None)
+            open_id = getattr(mid, "open_id", None) if mid else None
+            if open_id == self.bot_open_id:
+                return True
+        return False
 
     def _should_respond(self, message) -> bool:
         if self.respond_mode == "all":
@@ -277,7 +276,10 @@ class Bot:
 
     def _process(self, *, event_id: Optional[str], message_id: str, chat_id: str,
                  text: str, image_keys: list[str],
-                 parent_id: Optional[str] = None) -> None:
+                 parent_id: Optional[str] = None,
+                 chat_type: Optional[str] = None,
+                 sender_open_id: Optional[str] = None,
+                 is_mentioned: bool = False) -> None:
         image_bytes: Optional[bytes] = None
         image_source_id = message_id
         quoted_image_failure: Optional[str] = None
@@ -328,16 +330,197 @@ class Bot:
                 # Nothing actionable — skip silently rather than spamming.
                 return
 
+            # 3) Optional: load recent chat history as conversation context.
+            history_result = self._maybe_load_history(
+                chat_id=chat_id,
+                current_message_id=message_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                is_mentioned=is_mentioned,
+            )
+
             agent.handle_feishu_event(
                 text=text,
                 image_bytes=image_bytes,
                 message_id=message_id,
                 chat_id=chat_id,
                 event_id=event_id,
+                history=history_result,
             )
         except Exception as e:  # noqa: BLE001
             print(f"[bot] worker error processing {event_id}: {e}", file=sys.stderr)
             self._safe_error_reply(message_id, event_id, e)
+
+    # -- history loading ----------------------------------------------------
+
+    def _should_load_history(self, *, chat_type: Optional[str],
+                             is_mentioned: bool) -> bool:
+        """User-confirmed scope: ``mentions_and_p2p``.
+
+        P2P chats always qualify (the user is talking directly to the bot).
+        In groups, history is only loaded when the bot is @-mentioned —
+        we don't want random group chatter polluting context. Detecting a
+        mention requires ``FEISHU_BOT_OPEN_ID``; if it's unset we
+        conservatively skip history in groups (logged at INFO).
+        """
+        if not self.history_enabled:
+            return False
+        if chat_type == "p2p":
+            return True
+        if chat_type and chat_type != "p2p":
+            if not self.bot_open_id:
+                print(
+                    "[history] skipping in group: FEISHU_BOT_OPEN_ID unset, "
+                    "cannot reliably detect bot mention",
+                    file=sys.stderr,
+                )
+                return False
+            return is_mentioned
+        # Unknown chat_type — be conservative.
+        return False
+
+    def _maybe_load_history(
+        self,
+        *,
+        chat_id: str,
+        current_message_id: str,
+        chat_type: Optional[str],
+        sender_open_id: Optional[str],
+        is_mentioned: bool,
+    ) -> Optional["history_mod.HistoryResult"]:
+        """Fetch + assemble conversation context. Returns ``None`` on miss.
+
+        All failures degrade silently to "no history" — the primary reply
+        path must never break because history loading failed.
+        """
+        if not self._should_load_history(
+            chat_type=chat_type, is_mentioned=is_mentioned
+        ):
+            return None
+
+        # Time window (Unix seconds). 0 minutes ⇒ unlimited.
+        start_time_seconds: Optional[int] = None
+        if self.history_window_minutes > 0:
+            import time as _time
+
+            start_time_seconds = int(_time.time()) - self.history_window_minutes * 60
+
+        try:
+            raw_messages = feishu.list_chat_messages(
+                chat_id,
+                count=self.history_count,
+                start_time_seconds=start_time_seconds,
+            )
+        except feishu.FeishuError as e:
+            print(
+                f"[history] list_chat_messages failed (chat_id={chat_id}): {e}; "
+                "continuing without history",
+                file=sys.stderr,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[history] unexpected error loading history: {e}; "
+                "continuing without history",
+                file=sys.stderr,
+            )
+            return None
+
+        if not raw_messages:
+            return None
+
+        # Identify which messages carry images and download the most recent
+        # ``history_max_images`` of them. We download newest → oldest so the
+        # most-relevant images survive the cap.
+        image_bytes_by_key: dict = {}
+        if self.t2t_multimodal and self.history_max_images > 0:
+            image_bytes_by_key = self._download_history_images(
+                raw_messages,
+                current_message_id,
+                current_user_open_id=sender_open_id,
+            )
+
+        result = history_mod.build_history(
+            raw_messages,
+            current_user_open_id=sender_open_id,
+            bot_open_id=self.bot_open_id,
+            filter_mode="self_and_bot",
+            skip_message_ids={current_message_id} if current_message_id else None,
+            include_images=self.t2t_multimodal,
+            max_images=self.history_max_images,
+            image_bytes_by_key=image_bytes_by_key,
+        )
+
+        if result.image_count_skipped_no_multimodal > 0:
+            print(
+                f"[history] WARNING: T2T_MULTIMODAL is not enabled; skipped "
+                f"{result.image_count_skipped_no_multimodal} image(s) from "
+                f"conversation history. Set T2T_MULTIMODAL=1 to include "
+                f"historical images in LLM context.",
+                file=sys.stderr,
+            )
+        return result
+
+    def _download_history_images(
+        self,
+        raw_messages: list,
+        current_message_id: str,
+        *,
+        current_user_open_id: Optional[str] = None,
+    ) -> dict:
+        """Download up to ``history_max_images`` historical images.
+
+        Only considers messages that would pass the ``self_and_bot`` filter
+        in :func:`history.build_history` — i.e., messages from the current
+        user or the bot itself. This prevents third-party users' images in
+        a group chat from consuming the image budget (and from being fed
+        to the LLM later).
+
+        Walks ``raw_messages`` newest-first (the input is oldest → newest,
+        so we iterate ``reversed``) and stops once the cap is reached.
+        Per-image failures are logged and skipped — they must not break
+        the primary reply path.
+        """
+        downloaded: dict = {}
+        budget = self.history_max_images
+        for msg in reversed(raw_messages):
+            if budget <= 0:
+                break
+            msg_id = getattr(msg, "message_id", None)
+            if not msg_id or msg_id == current_message_id:
+                continue
+            if not history_mod._passes_filter(
+                msg,
+                history_mod._extract_sender_open_id(msg),
+                current_user_open_id=current_user_open_id,
+                bot_open_id=self.bot_open_id,
+                filter_mode="self_and_bot",
+            ):
+                continue
+            _, keys = _parse_quoted_message(msg)
+            for key in keys:
+                if budget <= 0:
+                    break
+                if key in downloaded:
+                    continue
+                try:
+                    downloaded[key] = feishu.download_message_resource(
+                        msg_id, key, type_="image"
+                    )
+                    budget -= 1
+                except feishu.FeishuError as e:
+                    print(
+                        f"[history] failed to download history image "
+                        f"(msg={msg_id}, key={key}): {e}; skipping",
+                        file=sys.stderr,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[history] unexpected error downloading history image: "
+                        f"{e}; skipping",
+                        file=sys.stderr,
+                    )
+        return downloaded
 
     def _resolve_quoted_image(self, parent_id: str
                               ) -> tuple[list[str], str, Optional[str]]:
@@ -388,15 +571,29 @@ def _build_bot_from_env() -> Bot:
         )
         respond_mode = "all"
     bot_open_id = os.environ.get("FEISHU_BOT_OPEN_ID") or None
-    workers = int(os.environ.get("FEISHU_WORKER_THREADS", "4"))
-    dedup = int(os.environ.get("FEISHU_DEDUP_CAPACITY", "1024"))
+    workers = _env_int("FEISHU_WORKER_THREADS", 4)
+    dedup = _env_int("FEISHU_DEDUP_CAPACITY", 1024)
     log_level = lark.LogLevel.DEBUG if os.environ.get("FEISHU_DEBUG") else lark.LogLevel.INFO
+    history_enabled = _env_bool("FEISHU_HISTORY_ENABLED", True)
+    history_count = _env_int("FEISHU_HISTORY_COUNT", DEFAULT_HISTORY_COUNT)
+    history_window_minutes = _env_int(
+        "FEISHU_HISTORY_WINDOW_MINUTES", DEFAULT_HISTORY_WINDOW_MINUTES
+    )
+    history_max_images = _env_int(
+        "FEISHU_HISTORY_MAX_IMAGES", DEFAULT_HISTORY_MAX_IMAGES
+    )
+    t2t_multimodal = _env_bool("T2T_MULTIMODAL", False)
     return Bot(
         respond_mode=respond_mode,
         bot_open_id=bot_open_id,
         worker_threads=workers,
         dedup_capacity=dedup,
         log_level=log_level,
+        history_enabled=history_enabled,
+        history_count=history_count,
+        history_window_minutes=history_window_minutes,
+        history_max_images=history_max_images,
+        t2t_multimodal=t2t_multimodal,
     )
 
 

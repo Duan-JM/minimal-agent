@@ -253,6 +253,24 @@ def _resolve_size(
     return "1024x1024"
 
 
+def _wrap_with_history(prompt: str, history_text_prefix: Optional[str]) -> str:
+    """Prepend conversation context to an Images-API prompt.
+
+    The Images API has no notion of multi-turn messages, so the bot
+    pre-renders recent chat history as plain text and we paste it in
+    front of the user's request, framed so the model can tell what's
+    context vs. what to draw. When ``history_text_prefix`` is empty or
+    None we return ``prompt`` unchanged so non-bot callers see no diff.
+    """
+    if not history_text_prefix:
+        return prompt
+    return (
+        f"Conversation context (oldest -> newest):\n"
+        f"{history_text_prefix}\n\n"
+        f"Current request: {prompt}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
@@ -302,6 +320,7 @@ def t2t(
     system: str = DEFAULT_T2T_SYSTEM,
     temperature: Optional[float] = None,
     max_tokens: int = 4096,
+    history: Optional[list] = None,
 ) -> str:
     """Text -> text.
 
@@ -309,12 +328,18 @@ def t2t(
     ``T2T_*`` (default qwen3-30b-a3b on llama.cpp). ``modalities=["text"]``
     is kept for safety so that callers who haven't split their endpoints
     yet still get text from a vllm-omni server.
+
+    ``history`` (optional): a list of prior OpenAI-format chat messages
+    (each ``{"role": "user"|"assistant", "content": str | list}``) to
+    insert between the system message and the current user prompt. The
+    bot passes the conversation history built by :func:`app.history.build_history`.
     """
+    messages: list = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": prompt})
     data = chat_completion(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
+        messages,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -327,12 +352,18 @@ def it2t(
     system: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: int = 4096,
+    history: Optional[list] = None,
 ) -> str:
     """Image + text -> text (VQA).
 
     Shares the same chat-completions endpoint as :func:`t2t` per the
     "vqa 和 t2t 用一个模型" directive — i.e. it goes to the ``T2T_*``
     endpoint, not the images endpoint.
+
+    ``history`` (optional): inserted between the optional system message
+    and the current user turn (which carries the image + prompt). Image
+    parts inside ``history`` require a multimodal-capable T2T endpoint
+    — see ``T2T_MULTIMODAL`` in the README.
 
     .. warning::
         The default qwen3-30b-a3b deployment on llama.cpp is text-only
@@ -343,9 +374,11 @@ def it2t(
     """
     cfg = _t2t_config()
     url = _encode_image_data_uri(image)
-    messages = []
+    messages: list = []
     if system:
         messages.append({"role": "system", "content": system})
+    if history:
+        messages.extend(history)
     messages.append(
         {
             "role": "user",
@@ -376,17 +409,25 @@ def t2i(
     aspect_ratio: str = "1:1",
     image_size: str = "1K",
     seed: int = 42,
+    history_text_prefix: Optional[str] = None,
 ) -> bytes:
     """Text -> image bytes via the OpenAI Images API.
 
     Mirrors ``t2i_example.sh``: ``POST {base_url}/images/generations`` with
     ``{prompt, size, seed}``. The response is parsed for ``data[0].b64_json``
     (with ``url`` fallbacks).
+
+    ``history_text_prefix`` (optional): a plaintext rendering of recent
+    conversation context. The Images API doesn't accept multi-turn
+    messages, so we fold history into the prompt string by prepending it
+    inside a ``Context: ... Request: ...`` block. The bot computes this
+    via :attr:`app.history.HistoryResult.text_summary`.
     """
     cfg = _config()
     url = f"{cfg['base_url']}/images/generations"
+    final_prompt = _wrap_with_history(prompt, history_text_prefix)
     body = {
-        "prompt": prompt,
+        "prompt": final_prompt,
         "size": _resolve_size(size, aspect_ratio, image_size),
         "seed": seed,
     }
@@ -416,18 +457,23 @@ def it2i(
     aspect_ratio: str = "1:1",
     image_size: str = "1K",
     output_format: str = "png",
+    history_text_prefix: Optional[str] = None,
 ) -> bytes:
     """Image + text -> image bytes via the OpenAI Images Edits API.
 
     Mirrors ``it2i_example.sh``: ``POST {base_url}/images/edits`` with a
     multipart body (``image`` file part + ``prompt`` / ``size`` /
     ``output_format`` form fields). Response parsing matches :func:`t2i`.
+
+    ``history_text_prefix`` (optional): folded into the prompt string —
+    see :func:`t2i` for the rationale.
     """
     cfg = _config()
     url = f"{cfg['base_url']}/images/edits"
     files = {"image": _image_to_multipart(image)}
+    final_prompt = _wrap_with_history(prompt, history_text_prefix)
     form = {
-        "prompt": prompt,
+        "prompt": final_prompt,
         "size": _resolve_size(size, aspect_ratio, image_size),
         "output_format": output_format,
     }

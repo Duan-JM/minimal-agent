@@ -438,5 +438,270 @@ class BotEnvBuilderTests(unittest.TestCase):
                 b.start()
 
 
+class BotShouldLoadHistoryTests(unittest.TestCase):
+    def _bot(self, **kwargs):
+        from app.bot import Bot
+        return Bot(**kwargs)
+
+    def test_p2p_always_loads(self):
+        b = self._bot(bot_open_id="ou_bot")
+        self.assertTrue(
+            b._should_load_history(chat_type="p2p", is_mentioned=False)
+        )
+
+    def test_group_loads_when_mentioned(self):
+        b = self._bot(bot_open_id="ou_bot")
+        self.assertTrue(
+            b._should_load_history(chat_type="group", is_mentioned=True)
+        )
+
+    def test_group_skipped_when_not_mentioned(self):
+        b = self._bot(bot_open_id="ou_bot")
+        self.assertFalse(
+            b._should_load_history(chat_type="group", is_mentioned=False)
+        )
+
+    def test_group_skipped_when_bot_open_id_missing(self):
+        b = self._bot(bot_open_id=None)
+        # Even if upstream thinks the bot was mentioned, we can't trust it
+        # without FEISHU_BOT_OPEN_ID — be conservative and skip.
+        self.assertFalse(
+            b._should_load_history(chat_type="group", is_mentioned=True)
+        )
+
+    def test_disabled_flag_short_circuits(self):
+        b = self._bot(bot_open_id="ou_bot", history_enabled=False)
+        self.assertFalse(
+            b._should_load_history(chat_type="p2p", is_mentioned=True)
+        )
+
+    def test_unknown_chat_type_conservative(self):
+        b = self._bot(bot_open_id="ou_bot")
+        self.assertFalse(
+            b._should_load_history(chat_type=None, is_mentioned=True)
+        )
+
+
+class BotHistoryWorkerTests(unittest.TestCase):
+    """Verify the worker (``_process``) loads history when eligible and
+    degrades gracefully when the API misbehaves."""
+
+    def setUp(self):
+        self.env_patch = mock.patch.dict(
+            os.environ,
+            {"FEISHU_APP_ID": "id", "FEISHU_APP_SECRET": "secret",
+             "ENABLE_LLM_ROUTER": "0"},
+            clear=False,
+        )
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def _make_bot(self, **kwargs):
+        from app.bot import Bot
+        defaults = {
+            "bot_open_id": "ou_bot",
+            "history_count": 5,
+            "history_window_minutes": 0,
+            "history_max_images": 0,
+            "t2t_multimodal": False,
+        }
+        defaults.update(kwargs)
+        bot = Bot(**defaults)
+        bot._executor = _SyncExecutor()
+        return bot
+
+    @staticmethod
+    def _history_msg(message_id, msg_type, content, sender_open_id):
+        m = mock.MagicMock()
+        m.message_id = message_id
+        m.msg_type = msg_type
+        m.body.content = json.dumps(content)
+        m.sender.id.open_id = sender_open_id
+        return m
+
+    def test_p2p_text_message_loads_history(self):
+        from app import bot as bot_mod
+        bot = self._make_bot()
+        evt = _make_event(content={"text": "next question"})
+        history_items = [
+            self._history_msg("h1", "text", {"text": "earlier"},
+                              sender_open_id="ou_user"),
+            self._history_msg("h2", "text", {"text": "earlier reply"},
+                              sender_open_id="ou_bot"),
+        ]
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=history_items) as lst, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        lst.assert_called_once()
+        # Worker passed a HistoryResult to the agent.
+        kw = h.call_args.kwargs
+        self.assertIn("history", kw)
+        self.assertIsNotNone(kw["history"])
+        roles = [m["role"] for m in kw["history"].chat_messages]
+        self.assertEqual(roles, ["user", "assistant"])
+
+    def test_group_unmentioned_does_not_load_history(self):
+        from app import bot as bot_mod
+        bot = self._make_bot()
+        evt = _make_event(chat_type="group", content={"text": "chatter"})
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages") as lst, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        lst.assert_not_called()
+        # handle_feishu_event still called (respond_mode=all by default), but
+        # with no history.
+        self.assertIsNone(h.call_args.kwargs.get("history"))
+
+    def test_group_mention_triggers_history_load(self):
+        from app import bot as bot_mod
+        bot = self._make_bot()
+        mention = mock.MagicMock()
+        mention.key = "@_user_1"
+        mention.id.open_id = "ou_bot"
+        evt = _make_event(
+            chat_type="group",
+            content={"text": "@_user_1 hi"},
+            mentions=[mention],
+        )
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=[]) as lst, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        lst.assert_called_once()
+        h.assert_called_once()
+
+    def test_history_disabled_skips_list_call(self):
+        from app import bot as bot_mod
+        bot = self._make_bot(history_enabled=False)
+        evt = _make_event(content={"text": "hi"})
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages") as lst, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        lst.assert_not_called()
+        self.assertIsNone(h.call_args.kwargs.get("history"))
+
+    def test_list_failure_degrades_to_no_history(self):
+        from app import bot as bot_mod
+        from app.feishu import FeishuError
+        bot = self._make_bot()
+        evt = _make_event(content={"text": "ping"})
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               side_effect=FeishuError("permission denied")), \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        h.assert_called_once()
+        self.assertIsNone(h.call_args.kwargs.get("history"))
+
+    def test_multimodal_off_with_history_images_warns(self):
+        from app import bot as bot_mod
+        bot = self._make_bot(t2t_multimodal=False)
+        evt = _make_event(content={"text": "what about that pic?"})
+        history_items = [
+            self._history_msg("h_img", "image", {"image_key": "img_a"},
+                              sender_open_id="ou_user"),
+        ]
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=history_items), \
+             mock.patch.object(bot_mod.feishu, "download_message_resource") as dl, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event"), \
+             mock.patch("sys.stderr") as stderr:
+            bot._dispatch(evt)
+        # Bot must NOT download history images when multimodal is off — it's
+        # wasted bandwidth.
+        dl.assert_not_called()
+        # And it must log a WARNING naming the skipped image.
+        printed = "".join(call.args[0] for call in stderr.write.call_args_list
+                          if call.args and isinstance(call.args[0], str))
+        self.assertIn("WARNING", printed)
+        self.assertIn("T2T_MULTIMODAL", printed)
+
+    def test_multimodal_on_downloads_history_images(self):
+        from app import bot as bot_mod
+        bot = self._make_bot(t2t_multimodal=True, history_max_images=2)
+        evt = _make_event(content={"text": "describe earlier pic"})
+        history_items = [
+            self._history_msg("h_img", "image", {"image_key": "img_a"},
+                              sender_open_id="ou_user"),
+        ]
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=history_items), \
+             mock.patch.object(bot_mod.feishu, "download_message_resource",
+                               return_value=b"\x89PNG\r\n\x1a\nABCD") as dl, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        dl.assert_called_once_with("h_img", "img_a", type_="image")
+        kw = h.call_args.kwargs
+        hist = kw["history"]
+        self.assertEqual(hist.image_count_included, 1)
+        self.assertEqual(hist.image_count_skipped_no_multimodal, 0)
+
+    def test_history_image_download_failure_skips_image_only(self):
+        from app import bot as bot_mod
+        from app.feishu import FeishuError
+        bot = self._make_bot(t2t_multimodal=True, history_max_images=2)
+        evt = _make_event(content={"text": "ok"})
+        history_items = [
+            self._history_msg("h_img", "image", {"image_key": "img_a"},
+                              sender_open_id="ou_user"),
+            self._history_msg("h_text", "text", {"text": "earlier reply"},
+                              sender_open_id="ou_bot"),
+        ]
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=history_items), \
+             mock.patch.object(bot_mod.feishu, "download_message_resource",
+                               side_effect=FeishuError("expired")), \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        # The download failure must not blow up the worker — text portion
+        # of history still passes through.
+        h.assert_called_once()
+        hist = h.call_args.kwargs["history"]
+        self.assertEqual(hist.image_count_included, 0)
+        # The text-only history message survives.
+        contents = [m["content"] for m in hist.chat_messages]
+        self.assertIn("earlier reply", contents)
+
+    def test_group_third_party_images_not_downloaded(self):
+        """In a group chat, ``_download_history_images`` must skip images
+        from third parties (not the current user, not the bot). Otherwise
+        the image budget gets consumed by irrelevant pictures and they
+        would also leak into LLM context."""
+        from app import bot as bot_mod
+        bot = self._make_bot(t2t_multimodal=True, history_max_images=2,
+                             bot_open_id="ou_bot")
+        # Group mention triggers history load.
+        mention = mock.MagicMock()
+        mention.key = "@_user_1"
+        mention.id.open_id = "ou_bot"
+        evt = _make_event(
+            chat_type="group",
+            content={"text": "@_user_1 what did I draw earlier?"},
+            mentions=[mention],
+        )
+        # Newest first: a stranger's image (must be skipped), then the
+        # current user's image (must be downloaded).
+        history_items = [
+            self._history_msg("h_self", "image", {"image_key": "img_user"},
+                              sender_open_id="ou_user"),
+            self._history_msg("h_stranger", "image",
+                              {"image_key": "img_other"},
+                              sender_open_id="ou_someone_else"),
+        ]
+        with mock.patch.object(bot_mod.feishu, "list_chat_messages",
+                               return_value=history_items), \
+             mock.patch.object(bot_mod.feishu, "download_message_resource",
+                               return_value=b"\x89PNG\r\n\x1a\nPIC") as dl, \
+             mock.patch.object(bot_mod.agent, "handle_feishu_event") as h:
+            bot._dispatch(evt)
+        # Only the current user's image is downloaded; stranger's image
+        # is filtered out before consuming budget.
+        dl.assert_called_once_with("h_self", "img_user", type_="image")
+        hist = h.call_args.kwargs["history"]
+        # Stranger's message is also filtered from chat_messages.
+        self.assertNotIn("img_other",
+                         json.dumps(hist.chat_messages, default=str))
+
+
 if __name__ == "__main__":
     unittest.main()
