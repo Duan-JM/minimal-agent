@@ -4,11 +4,43 @@ version = "0.3.0"
 description = "Minimal multimodal Feishu chatbot bridging an OpenAI-compatible endpoint and the Feishu Open Platform (lark-oapi WebSocket mode)."
 readme = "README.md"
 requires-python = ">=3.9"
+license = {file = "LICENSE"}
+keywords = [
+    "feishu",
+    "lark",
+    "chatbot",
+    "multimodal",
+    "openai",
+    "llm",
+    "vision",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "requests>=2.31",
     "python-dotenv>=1.0",
     "lark-oapi>=1.4.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Duan-JM/minimal-agent"
+Repository = "https://github.com/Duan-JM/minimal-agent"
+Issues = "https://github.com/Duan-JM/minimal-agent/issues"
 
 [project.scripts]
 minimal-agent = "app.__main__:main"
