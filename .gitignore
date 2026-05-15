@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# minimal-agent: generated images, manual test fixtures, and macOS / agent
+# tooling that shouldn't be tracked.
+output_images/
+inputs/
+.DS_Store
+.agents/
