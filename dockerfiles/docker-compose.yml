@@ -1,0 +1,49 @@
+# Deploy compose for the `minimal-agent` Feishu bot (long-connection,
+# `serve` mode). The LLM backend (vllm/vllm-omni) is managed separately
+# by the repo-root docker-compose.yml — this file only runs the agent.
+#
+# Usage (from the repo root):
+#
+#   # Build the image for linux/amd64 and start the bot in the background.
+#   docker compose -f dockerfiles/docker-compose.yml up -d --build
+#
+#   # Tail logs.
+#   docker compose -f dockerfiles/docker-compose.yml logs -f
+#
+#   # Stop.
+#   docker compose -f dockerfiles/docker-compose.yml down
+#
+# Requirements:
+#   * A `.env` file at the repo root with at minimum FEISHU_APP_ID and
+#     FEISHU_APP_SECRET (see .env.example).
+#   * Reachable OpenAI-compatible endpoint(s). When the vllm backend runs
+#     on the host (via the repo-root compose), point OPENAI_BASE_URL at
+#     `http://host.docker.internal:8000/v1` — `extra_hosts` below maps
+#     that name to the host gateway on every platform.
+
+services:
+  minimal-agent:
+    build:
+      context: ..
+      dockerfile: dockerfiles/Dockerfile
+      platforms:
+        - linux/amd64
+    image: minimal-agent:latest
+    platform: linux/amd64
+    container_name: minimal-agent
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      OUTPUT_DIR: /app/output_images
+    volumes:
+      # Persist generated images outside the container so they survive
+      # rebuilds and are reachable from the host for debugging.
+      - ../output_images:/app/output_images
+    extra_hosts:
+      # Allow the container to reach an LLM endpoint that's bound to the
+      # host (e.g. the vllm service from the repo-root compose). Works on
+      # Linux, macOS, and Windows.
+      - "host.docker.internal:host-gateway"
+    # The bot is outbound-only (Feishu long-connection WebSocket); no
+    # ports need to be published.

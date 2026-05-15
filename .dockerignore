@@ -1,0 +1,46 @@
+# Keep the build context small — only what the Dockerfile actually copies
+# (pyproject.toml, uv.lock, README.md, app/) needs to ship in.
+
+# VCS / editor / OS
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+.DS_Store
+
+# Virtualenvs / Python caches
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Local secrets / dev artefacts
+.env
+.env.*
+!.env.example
+.agents
+
+# Generated / scratch material that isn't needed inside the image
+output_images
+inputs
+t2i_example.sh
+official_example.py
+requests_example
+tests
+
+# Read-only upstream reference material (already excluded from the wheel,
+# but excluding it from the build context too saves ~21 MB of copy time).
+app/lark-samples-main
+
+# Docker artefacts themselves don't need to be inside the build context.
+dockerfiles
+docker-compose.yml
+.dockerignore

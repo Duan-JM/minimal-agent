@@ -147,13 +147,31 @@ back-compat shim that rewrites `minimal-agent "prompt"` to
 
 ### Infrastructure
 
-- **Docker Compose** (`docker-compose.yml`): runs `vllm/vllm-omni` serving the
-  multimodal images model (default `sensenova/SenseNova-U1-8B-MoT`) on
-  `localhost:8000`. This is the backing endpoint for `t2i` / `it2i` during
-  local development. The text-only `T2T_*` endpoint is **not** managed by this
-  compose file — point it at a separate llama.cpp / vLLM instance.
-- No `dockerfiles/` directory; no migration / dev scripts beyond
-  `app/start-lark.sh`.
+- **Docker Compose** (`docker-compose.yml`, at repo root): runs
+  `vllm/vllm-omni` serving the multimodal images model (default
+  `sensenova/SenseNova-U1-8B-MoT`) on `localhost:8000`. This is the
+  backing endpoint for `t2i` / `it2i` during local development. The
+  text-only `T2T_*` endpoint is **not** managed by this compose file —
+  point it at a separate llama.cpp / vLLM instance.
+- **Agent container** (`dockerfiles/Dockerfile`): multi-stage,
+  `linux/amd64`-only build of `minimal-agent` itself, driven by `uv` (no
+  pip/poetry). The builder installs the project + deps into `/opt/venv`
+  with `uv sync --frozen --no-dev --no-editable`; the runtime stage
+  drops `uv`, copies only the venv, and runs as a non-root `agent` user.
+  Default `CMD` is `serve`; override with `run "…"` to invoke the
+  one-shot CLI. Build from the repo root with
+  `docker buildx build --platform linux/amd64 -t minimal-agent:latest -f dockerfiles/Dockerfile .`.
+- **Agent deploy compose** (`dockerfiles/docker-compose.yml`):
+  orchestrates the `minimal-agent serve` container. Reads `../.env`
+  (repo-root `.env`), persists generated images via a bind mount on
+  `../output_images`, and maps `host.docker.internal` to the host
+  gateway so the container can reach a vllm backend running on the host.
+  No ports are published — the bot is outbound-only (Feishu WebSocket).
+  Bring up with `docker compose -f dockerfiles/docker-compose.yml up -d --build`.
+- **`.dockerignore`** (repo root) trims the build context — keeps `.git`,
+  `.venv`, `output_images`, `inputs`, `tests`, `requests_example`, and
+  the upstream `app/lark-samples-main/` reference tree out of the image.
+- No migration / dev scripts beyond `app/start-lark.sh`.
 
 ## Code Style
 
