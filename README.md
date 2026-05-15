@@ -56,7 +56,10 @@ uv run minimal-agent run "local only, no Feishu push" --no-feishu
 
 `--mode` is the recommended way to pick a tool. Without it the agent uses a
 deterministic keyword router (Chinese + English) for draw/edit intents. Set
-`ENABLE_LLM_ROUTER=1` to opt into LLM-based tool selection instead.
+`ENABLE_LLM_ROUTER=1` to opt into LLM-based tool selection instead — the
+router uses OpenAI's standard `tools` / function-calling protocol against
+the `T2T_*` endpoint and falls back to the keyword router on any
+backend/parse failure.
 
 ### Managing dependencies with uv
 
@@ -158,7 +161,7 @@ if present). See `.env.example`.
 | Var | Default | Purpose |
 |---|---|---|
 | `OUTPUT_DIR` | `./output_images` | Where generated images are saved. |
-| `ENABLE_LLM_ROUTER` | `0` | Set to `1` to let the LLM choose the tool. |
+| `ENABLE_LLM_ROUTER` | `0` | Set to `1` to let the LLM choose the tool via OpenAI tools/function-calling (requires a backend that supports `tools`; falls back to the keyword router on miss). |
 | `LLM_TIMEOUT` | `300` | Per-LLM-request timeout in seconds. |
 
 ## Project layout

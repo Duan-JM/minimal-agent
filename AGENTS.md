@@ -16,7 +16,8 @@ OpenAI-compatible LLM endpoint and Feishu (Lark). It provides:
   `t2t` (text→text), `t2i` (text→image), `it2t` (image+text→text, VQA),
   `it2i` (image+text→image, edit).
 - A deterministic Chinese+English keyword tool router (with optional
-  LLM-based routing behind `ENABLE_LLM_ROUTER=1`).
+  LLM-based routing via OpenAI tools/function-calling behind
+  `ENABLE_LLM_ROUTER=1`).
 
 ## Commands
 
