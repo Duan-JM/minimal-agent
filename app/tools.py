@@ -260,6 +260,43 @@ def _resolve_size(
 DEFAULT_T2T_SYSTEM = "You are a helpful assistant."
 
 
+def chat_completion(
+    messages: list,
+    *,
+    tools: Optional[list] = None,
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+    temperature: Optional[float] = None,
+    max_tokens: int = 4096,
+) -> Dict[str, Any]:
+    """Low-level chat-completions call returning the raw response dict.
+
+    Targets the same ``T2T_*`` endpoint as :func:`t2t` / :func:`it2t` and
+    keeps the ``modalities=["text"]`` + ``enable_thinking`` template kwargs
+    consistent. The router uses this to invoke OpenAI's tools /
+    function-calling protocol and inspect ``choices[0].message.tool_calls``.
+
+    Pass ``tools=[…]`` to enable function-calling. ``tool_choice`` is forwarded
+    verbatim (``"auto"``, ``"required"``, or ``{"type": "function", ...}``).
+    """
+    cfg = _t2t_config()
+    payload: Dict[str, Any] = {
+        "model": cfg["model"],
+        "messages": messages,
+        "modalities": ["text"],
+        "stream": False,
+        "temperature": _t2t_temperature(temperature),
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": {
+            "enable_thinking": _env_bool("LLM_ENABLE_THINKING", False)
+        },
+    }
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    return _post_chat(payload, cfg=cfg)
+
+
 def t2t(
     prompt: str,
     system: str = DEFAULT_T2T_SYSTEM,
@@ -273,22 +310,15 @@ def t2t(
     is kept for safety so that callers who haven't split their endpoints
     yet still get text from a vllm-omni server.
     """
-    cfg = _t2t_config()
-    payload = {
-        "model": cfg["model"],
-        "messages": [
+    data = chat_completion(
+        [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "modalities": ["text"],
-        "stream": False,
-        "temperature": _t2t_temperature(temperature),
-        "max_tokens": max_tokens,
-        "chat_template_kwargs": {
-            "enable_thinking": _env_bool("LLM_ENABLE_THINKING", False)
-        },
-    }
-    return _extract_text(_post_chat(payload, cfg=cfg))
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return _extract_text(data)
 
 
 def it2t(

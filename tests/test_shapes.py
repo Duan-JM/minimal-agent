@@ -444,15 +444,204 @@ class RouterTests(unittest.TestCase):
 
     def test_llm_router_opt_in(self):
         from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "t2i", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
+        captured = {}
+
+        def fake_cc(messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return fake_response
+
         with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
-             mock.patch.object(agent.tools, "t2t", return_value='{"tool":"t2i"}'):
+             mock.patch.object(agent.tools, "chat_completion", side_effect=fake_cc):
+            self.assertEqual(agent.decide_tool("ambiguous", has_image=False), "t2i")
+        # The router uses the standard OpenAI tools/function-calling protocol.
+        self.assertEqual(captured["kwargs"]["tool_choice"], "auto")
+        self.assertEqual(captured["kwargs"]["temperature"], 0.0)
+        names = [t["function"]["name"] for t in captured["kwargs"]["tools"]]
+        # With no image we only offer t2t / t2i — never the it2* options.
+        self.assertEqual(sorted(names), ["t2i", "t2t"])
+
+    def test_llm_router_filters_tools_when_image_present(self):
+        from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "it2i", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
+        captured = {}
+
+        def fake_cc(messages, **kwargs):
+            captured["kwargs"] = kwargs
+            return fake_response
+
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", side_effect=fake_cc):
+            self.assertEqual(agent.decide_tool("做点什么", has_image=True), "it2i")
+        names = [t["function"]["name"] for t in captured["kwargs"]["tools"]]
+        # With an image we only offer it2t / it2i.
+        self.assertEqual(sorted(names), ["it2i", "it2t"])
+
+    def test_llm_router_accepts_response_with_malformed_arguments(self):
+        """The agent ignores ``function.arguments`` today, so a malformed
+        arguments string must not crash routing — only the function ``name``
+        matters."""
+        from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "t2i", "arguments": "not-json{{{"},
+                    }],
+                },
+            }],
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
             self.assertEqual(agent.decide_tool("ambiguous", has_image=False), "t2i")
 
-    def test_llm_router_invalid_falls_back(self):
+    def test_llm_router_prefers_tool_calls_over_content(self):
+        """If the response has both ``tool_calls`` and a content blob, only
+        ``tool_calls`` is consulted."""
         from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "content": '{"tool":"t2t"}',  # would route to t2t if read
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "t2i", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
         with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
-             mock.patch.object(agent.tools, "t2t", return_value="garbage"):
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
+            # Heuristic for "ambiguous" without image would be t2t; tool_calls
+            # wins and gives us t2i.
+            self.assertEqual(agent.decide_tool("ambiguous", has_image=False), "t2i")
+
+    def test_llm_router_no_tool_calls_falls_back(self):
+        """A response with no tool_calls (regardless of content) falls back to
+        the keyword router."""
+        from app import agent
+
+        fake_response = {"choices": [{"message": {"content": "garbage"}}]}
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
             # Falls back to heuristic, which routes "draw" → t2i.
+            self.assertEqual(agent.decide_tool("draw an apple", has_image=False), "t2i")
+
+    def test_llm_router_empty_tool_calls_list_falls_back(self):
+        from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {"tool_calls": []},
+            }],
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
+            self.assertEqual(agent.decide_tool("draw an apple", has_image=False), "t2i")
+
+    def test_llm_router_invalid_tool_name_falls_back(self):
+        """An unknown function name from the LLM falls through to the
+        heuristic router."""
+        from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "ocr", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
+            self.assertEqual(agent.decide_tool("draw an apple", has_image=False), "t2i")
+
+    def test_llm_router_cross_modality_tool_falls_back(self):
+        """An impossible tool for the current has_image state (e.g. it2i
+        when no image is attached) must be treated as a routing miss, not
+        silently remapped inside ``_llm_route``."""
+        from app import agent
+
+        fake_response = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "it2i", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", return_value=fake_response):
+            # has_image=False makes it2i out-of-set → fall back to heuristic
+            # for "draw an apple" → t2i.
+            self.assertEqual(agent.decide_tool("draw an apple", has_image=False), "t2i")
+
+    def test_llm_router_malformed_tool_calls_shape_falls_back(self):
+        """Defensive parsing: any unexpected response shape returns ``None``
+        rather than raising, so routing falls back gracefully."""
+        from app import agent
+
+        bad_shapes = [
+            {"choices": [{"message": {"tool_calls": "not-a-list"}}]},
+            {"choices": [{"message": {"tool_calls": ["not-a-dict"]}}]},
+            {"choices": [{"message": {"tool_calls": [{"function": "not-a-dict"}]}}]},
+            {"choices": [{"message": {"tool_calls": [{"function": {"name": None}}]}}]},
+            {"choices": [{"message": {"tool_calls": [{"function": {}}]}}]},
+            {"choices": [{"message": "not-a-dict"}]},
+            {"choices": []},
+            {},
+        ]
+        for shape in bad_shapes:
+            with self.subTest(shape=str(shape)[:80]):
+                with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+                     mock.patch.object(agent.tools, "chat_completion", return_value=shape):
+                    self.assertEqual(
+                        agent.decide_tool("draw an apple", has_image=False),
+                        "t2i",
+                    )
+
+    def test_llm_router_exception_falls_back(self):
+        from app import agent
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("backend down")
+
+        with mock.patch.dict(os.environ, {"ENABLE_LLM_ROUTER": "1"}), \
+             mock.patch.object(agent.tools, "chat_completion", side_effect=boom):
             self.assertEqual(agent.decide_tool("draw an apple", has_image=False), "t2i")
 
 

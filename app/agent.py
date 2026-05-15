@@ -3,9 +3,7 @@ deliver the result back to Feishu (either as a one-shot send in CLI mode, or
 as a threaded reply in bot mode)."""
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -16,6 +14,93 @@ from . import feishu, tools
 
 
 VALID_TOOLS = ("t2t", "t2i", "it2t", "it2i")
+
+# OpenAI tools/function-calling schema for each capability. The router
+# advertises only the schemas compatible with the current has_image value so
+# the LLM never sees impossible options. The ``prompt`` argument exists so
+# the schema is well-formed (and so a future change can act on a refined
+# prompt) — the agent currently ignores the returned arguments and reuses
+# the user's original prompt.
+_ROUTER_TOOL_SCHEMAS: dict = {
+    "t2t": {
+        "type": "function",
+        "function": {
+            "name": "t2t",
+            "description": (
+                "Answer the user with text only. Use when no image is attached "
+                "and the user wants a textual answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The user prompt to answer."}
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    "t2i": {
+        "type": "function",
+        "function": {
+            "name": "t2i",
+            "description": (
+                "Generate a brand-new image from a text description. Use when "
+                "no image is attached and the user wants a picture back."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Image-generation prompt (English works best).",
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    "it2t": {
+        "type": "function",
+        "function": {
+            "name": "it2t",
+            "description": (
+                "Describe or answer questions about the user's input image with "
+                "text. Use when an image is attached and the user wants a text answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The question or task to perform on the image.",
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    "it2i": {
+        "type": "function",
+        "function": {
+            "name": "it2i",
+            "description": (
+                "Edit / restyle / transform the user's input image and return a "
+                "new image. Use when an image is attached and the user wants a "
+                "modified picture back."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Edit instruction (English works best).",
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+}
 
 IMAGE_GEN_KEYWORDS = (
     "draw", "generate image", "generate an image", "generate a picture",
@@ -72,20 +157,38 @@ def _heuristic_route(prompt: str, has_image: bool) -> str:
 
 
 def _llm_route(prompt: str, has_image: bool) -> Optional[str]:
-    instruction = (
-        "你是一个工具路由器。根据用户输入和是否附带图片，选择四个工具之一：\n"
-        "- t2t  纯文字问答（无图片输入，输出文字）\n"
-        "- t2i  根据文字生成新图片（无图片输入，输出图片）\n"
-        "- it2t 理解/描述输入的图片，输出文字\n"
-        "- it2i 基于输入图片进行编辑/改写，输出新图片\n\n"
-        f"用户输入: {prompt!r}\n"
-        f"是否附带图片: {'是' if has_image else '否'}\n\n"
-        '只输出形如 {"tool":"t2t"} 的 JSON，不要多余解释。'
+    """Ask the LLM to pick a tool via OpenAI's tools/function-calling.
+
+    Returns ``None`` (so ``route()`` falls back to the keyword router) when:
+
+    - the chat call raises,
+    - the response has no usable ``tool_calls``,
+    - the picked tool name isn't one of the offered candidates.
+
+    All response parsing is defensive — any unexpected shape returns ``None``
+    rather than raising, so a flaky backend never breaks routing.
+    """
+    candidate_names = ("it2t", "it2i") if has_image else ("t2t", "t2i")
+    tool_schemas = [_ROUTER_TOOL_SCHEMAS[name] for name in candidate_names]
+
+    system_msg = (
+        "You are a tool router. Pick exactly one of the available functions "
+        "that best matches the user's request. Do not answer the user yourself."
     )
+    user_msg = (
+        f"User prompt: {prompt!r}\n"
+        f"Has image attached: {'yes' if has_image else 'no'}\n"
+        "Call the single function that best fits."
+    )
+
     try:
-        raw = tools.t2t(
-            instruction,
-            system="You output strictly one JSON object. No prose.",
+        data = tools.chat_completion(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            tools=tool_schemas,
+            tool_choice="auto",
             temperature=0.0,
             max_tokens=64,
         )
@@ -93,24 +196,47 @@ def _llm_route(prompt: str, has_image: bool) -> Optional[str]:
         print(f"[router] LLM routing failed, falling back to heuristic: {e}", file=sys.stderr)
         return None
 
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if not match:
-        print(f"[router] LLM did not return JSON, got: {raw!r}", file=sys.stderr)
-        return None
     try:
-        obj = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        print(f"[router] LLM JSON parse failed: {raw!r}", file=sys.stderr)
+        message = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        print(f"[router] LLM response had no message: {str(data)[:300]!r}", file=sys.stderr)
         return None
-    tool = (obj.get("tool") or "").strip()
-    if tool not in VALID_TOOLS:
-        print(f"[router] LLM returned invalid tool: {tool!r}", file=sys.stderr)
+    if not isinstance(message, dict):
+        print(f"[router] LLM message is not a dict: {type(message).__name__}", file=sys.stderr)
         return None
-    return tool
+
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        print(
+            "[router] LLM returned no tool_calls; falling back to heuristic",
+            file=sys.stderr,
+        )
+        return None
+
+    first = tool_calls[0]
+    if not isinstance(first, dict):
+        print(f"[router] LLM tool_calls[0] is not a dict: {first!r}", file=sys.stderr)
+        return None
+    fn = first.get("function")
+    if not isinstance(fn, dict):
+        print(f"[router] LLM tool_calls[0].function is not a dict: {fn!r}", file=sys.stderr)
+        return None
+    name = fn.get("name")
+    if not isinstance(name, str):
+        print(f"[router] LLM returned non-string function name: {name!r}", file=sys.stderr)
+        return None
+    name = name.strip()
+    # Validate against the offered candidates — not the full VALID_TOOLS —
+    # so a buggy backend returning an impossible cross-modality tool is
+    # surfaced as a routing miss rather than silently remapped.
+    if name not in candidate_names:
+        print(
+            f"[router] LLM returned out-of-set tool name: {name!r} "
+            f"(allowed: {candidate_names})",
+            file=sys.stderr,
+        )
+        return None
+    return name
 
 
 def route(prompt: str, has_image: bool) -> str:
