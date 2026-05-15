@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from . import feishu, tools
+from .history import HistoryResult
 
 
 VALID_TOOLS = ("t2t", "t2i", "it2t", "it2i")
@@ -266,19 +267,30 @@ def decide_tool(prompt: str, has_image: bool, mode: Optional[str] = None) -> str
 
 
 def execute_tool(tool: str, prompt: str,
-                 image: Optional[Union[str, Path, bytes]] = None) -> ToolResult:
+                 image: Optional[Union[str, Path, bytes]] = None,
+                 history: Optional[HistoryResult] = None) -> ToolResult:
+    chat_history = history.chat_messages if history else None
+    text_prefix = history.text_summary if history else None
     if tool == "t2t":
-        return ToolResult(tool=tool, text=tools.t2t(prompt))
+        return ToolResult(tool=tool, text=tools.t2t(prompt, history=chat_history))
     if tool == "it2t":
         if image is None:
             raise ValueError("it2t requires an image input")
-        return ToolResult(tool=tool, text=tools.it2t(image, prompt))
+        return ToolResult(
+            tool=tool, text=tools.it2t(image, prompt, history=chat_history)
+        )
     if tool == "t2i":
-        return ToolResult(tool=tool, image_bytes=tools.t2i(prompt))
+        return ToolResult(
+            tool=tool,
+            image_bytes=tools.t2i(prompt, history_text_prefix=text_prefix),
+        )
     if tool == "it2i":
         if image is None:
             raise ValueError("it2i requires an image input")
-        return ToolResult(tool=tool, image_bytes=tools.it2i(image, prompt))
+        return ToolResult(
+            tool=tool,
+            image_bytes=tools.it2i(image, prompt, history_text_prefix=text_prefix),
+        )
     raise ValueError(f"unknown tool {tool!r}")
 
 
@@ -396,12 +408,18 @@ def handle_feishu_event(
     mode: Optional[str] = None,
     output_dir: str = "./output_images",
     save_image_locally: bool = True,
+    history: Optional[HistoryResult] = None,
 ) -> ToolResult:
     """Dispatch a parsed Feishu message and reply through the IM API.
 
     The reply uses ``/im/v1/messages/{message_id}/reply`` so answers thread
     under the user's message. ``event_id`` (if provided) is used as part of the
     message ``uuid`` for idempotency.
+
+    ``history`` (optional): pre-built conversation context from
+    :func:`app.history.build_history`. ``chat_messages`` are passed to
+    ``t2t`` / ``it2t`` and ``text_summary`` is folded into the prompt for
+    ``t2i`` / ``it2i``.
     """
     has_image = image_bytes is not None
     if not text and not has_image:
@@ -409,13 +427,21 @@ def handle_feishu_event(
 
     prompt = text.strip() if text else DEFAULT_IMAGE_ONLY_PROMPT
     tool = decide_tool(prompt, has_image, mode)
+    history_info = ""
+    if history and history.has_content:
+        history_info = (
+            f" history_msgs={len(history.chat_messages)}"
+            f" history_imgs={history.image_count_included}"
+            f"/{history.image_count_total}"
+        )
     print(
         f"[agent] feishu event tool={tool} has_image={has_image} chat_id={chat_id} "
-        f"msg={message_id} event={event_id}",
+        f"msg={message_id} event={event_id}{history_info}",
         file=sys.stderr,
     )
 
-    result = execute_tool(tool, prompt, image_bytes if has_image else None)
+    result = execute_tool(tool, prompt, image_bytes if has_image else None,
+                          history=history)
 
     uuid = _make_uuid(event_id, message_id, tool)
 

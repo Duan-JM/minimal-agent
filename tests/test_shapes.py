@@ -208,6 +208,125 @@ class ToolPayloadShapeTests(unittest.TestCase):
 
     # ---- it2t (text chat-completions endpoint, vision-style message) ----
 
+    def test_t2t_history_is_inserted_before_user_turn(self):
+        """``history`` kwarg places prior chat messages between the system
+        prompt and the current user turn — matches the OpenAI shape."""
+        from app import tools
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _stub_response({"choices": [{"message": {"content": "ok"}}]})
+
+        history = [
+            {"role": "user", "content": "earlier user"},
+            {"role": "assistant", "content": "earlier bot"},
+        ]
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.t2t("now", history=history)
+        msgs = captured["json"]["messages"]
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[1], {"role": "user", "content": "earlier user"})
+        self.assertEqual(msgs[2], {"role": "assistant", "content": "earlier bot"})
+        self.assertEqual(msgs[3], {"role": "user", "content": "now"})
+
+    def test_t2t_no_history_keeps_two_messages(self):
+        """Backwards compat: when ``history`` is omitted, the payload still
+        carries exactly ``[system, user]`` (no extra empty turns)."""
+        from app import tools
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _stub_response({"choices": [{"message": {"content": "ok"}}]})
+
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.t2t("just this")
+        msgs = captured["json"]["messages"]
+        self.assertEqual(len(msgs), 2)
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[1], {"role": "user", "content": "just this"})
+
+    def test_it2t_history_is_inserted_before_current_image_turn(self):
+        from app import tools
+
+        img_path = ROOT / "tests_tmp_in_hist.jpg"
+        img_path.write_bytes(b"\xff\xd8\xff\xe0HISTORY")
+        self.addCleanup(img_path.unlink)
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _stub_response({"choices": [{"message": {"content": "fine"}}]})
+
+        history = [{"role": "assistant", "content": "earlier reply"}]
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.it2t(str(img_path), "describe", history=history)
+        msgs = captured["json"]["messages"]
+        # history precedes the current image+text turn (the last message).
+        self.assertEqual(msgs[-2],
+                         {"role": "assistant", "content": "earlier reply"})
+        last = msgs[-1]
+        self.assertEqual(last["role"], "user")
+        kinds = [p.get("type") for p in last["content"]]
+        self.assertEqual(kinds, ["image_url", "text"])
+
+    def test_t2i_history_text_prefix_folds_into_prompt(self):
+        from app import tools
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _stub_response(_images_api_response())
+
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.t2i("a cat",
+                      history_text_prefix="[user]: earlier\n[assistant]: ok")
+        prompt = captured["json"]["prompt"]
+        self.assertIn("Conversation context", prompt)
+        self.assertIn("[user]: earlier", prompt)
+        self.assertIn("Current request: a cat", prompt)
+
+    def test_t2i_no_history_prefix_keeps_prompt_verbatim(self):
+        from app import tools
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _stub_response(_images_api_response())
+
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.t2i("a cat")
+        self.assertEqual(captured["json"]["prompt"], "a cat")
+
+    def test_it2i_history_text_prefix_folds_into_form_prompt(self):
+        from app import tools
+
+        img_path = ROOT / "tests_tmp_in_it2i_hist.jpg"
+        img_path.write_bytes(b"\xff\xd8\xff\xe0PIC")
+        self.addCleanup(img_path.unlink)
+
+        captured = {}
+
+        def fake_post(url, *args, **kwargs):
+            captured["data"] = kwargs.get("data")
+            return _stub_response(_images_api_response())
+
+        with mock.patch.object(tools.requests, "post", side_effect=fake_post):
+            tools.it2i(str(img_path), "make it red",
+                       history_text_prefix="[user]: keep it bright")
+        form = captured["data"]
+        self.assertIn("Conversation context", form["prompt"])
+        self.assertIn("[user]: keep it bright", form["prompt"])
+        self.assertIn("Current request: make it red", form["prompt"])
+
+    # ---- t2i (Images API: /v1/images/generations) -----------------------
+
     def test_it2t_payload(self):
         from app import tools
 
@@ -814,6 +933,62 @@ class FeishuSDKTests(unittest.TestCase):
         )
         with self.assertRaises(feishu.FeishuError):
             feishu.get_message("om_parent")
+
+    def test_list_chat_messages_request_shape(self):
+        """``feishu.list_chat_messages`` must:
+
+        - target ``im.v1.message.list`` on the ``chat`` container,
+        - clamp ``page_size`` to ≤50 (Feishu API limit),
+        - pass ``start_time`` as a string of Unix seconds when provided,
+        - reverse the SDK's newest-first result into oldest → newest.
+        """
+        from app import feishu
+
+        item_a = mock.MagicMock(message_id="m_new")
+        item_b = mock.MagicMock(message_id="m_old")
+        # SDK returns newest → oldest (sort_type=ByCreateTimeDesc).
+        self.fake_client.im.v1.message.list.return_value = _ok(
+            data=mock.MagicMock(items=[item_a, item_b])
+        )
+
+        out = feishu.list_chat_messages("oc_chat",
+                                        count=200,
+                                        start_time_seconds=1700000000)
+        # Oldest → newest is the contract for downstream history building.
+        self.assertEqual([m.message_id for m in out], ["m_old", "m_new"])
+
+        req = self.fake_client.im.v1.message.list.call_args.args[0]
+        self.assertEqual(req.container_id_type, "chat")
+        self.assertEqual(req.container_id, "oc_chat")
+        # 200 must be clamped to the Feishu page_size cap (50).
+        self.assertEqual(req.page_size, 50)
+        self.assertEqual(req.sort_type, "ByCreateTimeDesc")
+        # start_time is required to be a string of Unix seconds.
+        self.assertEqual(req.start_time, "1700000000")
+
+    def test_list_chat_messages_no_start_time_omits_it(self):
+        from app import feishu
+        self.fake_client.im.v1.message.list.return_value = _ok(
+            data=mock.MagicMock(items=[])
+        )
+        feishu.list_chat_messages("oc_chat", count=5)
+        req = self.fake_client.im.v1.message.list.call_args.args[0]
+        self.assertEqual(req.page_size, 5)
+        # start_time defaults to None on the builder when not set.
+        self.assertIsNone(getattr(req, "start_time", None))
+
+    def test_list_chat_messages_api_failure_raises(self):
+        from app import feishu
+        self.fake_client.im.v1.message.list.return_value = _fail(
+            code=99991663, msg="permission"
+        )
+        with self.assertRaises(feishu.FeishuError):
+            feishu.list_chat_messages("oc_chat")
+
+    def test_list_chat_messages_rejects_empty_chat_id(self):
+        from app import feishu
+        with self.assertRaises(feishu.FeishuError):
+            feishu.list_chat_messages("")
 
 
 class FeishuClientBuildTests(unittest.TestCase):

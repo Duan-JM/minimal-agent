@@ -23,7 +23,11 @@ endpoint:
 | `it2t` | 文字 + 图片生成文字           | image + text → text (vision) |
 | `it2i` | 图片 + 文字编辑生成图片       | image + text → image (edit) |
 
-Single-turn only — no conversation history.
+Each event is still a single tool call — there is no autonomous multi-step
+agent loop — but when the bot is @-mentioned in a group (or DMed in P2P) it
+will pull recent chat history from Feishu via `im.v1.message.list` and feed
+it to the LLM as conversation context (see *Conversation history context*
+below).
 
 The HTTP payloads sent to the LLM are kept consistent with the reference shell
 scripts in `requests_example/` and are covered by unit tests in `tests/`.
@@ -83,6 +87,9 @@ connection. **No reverse proxy, ngrok or webhook URL needed.**
    - `im:message` (receive messages)
    - `im:message:send_as_bot` (send replies)
    - `im:resource` (download user-uploaded images)
+   - `im:message:readonly` *(only required if `FEISHU_HISTORY_ENABLED=1`,
+     which is the default — used by `im.v1.message.list` to load
+     conversation history when @-mentioned or in P2P)*
 4. In **Features → Bot**, enable the bot and add it to the chats you want to
    chat with.
 5. In **Events & Callbacks → Event Subscription**:
@@ -125,6 +132,35 @@ The bot also:
 - **Best-effort error replies** — if a worker raises, the bot tries to reply
   with a short error so the user isn't left waiting.
 
+### Conversation history context
+
+When the bot is engaged (P2P chat, or @-mentioned in a group) it pulls
+recent messages from the same chat via `im.v1.message.list` and passes
+them to the LLM as the OpenAI `messages` history. Concretely:
+
+- **Scope** — only loads in P2P chats and `@`-mentioned group messages.
+  In groups, mention detection requires `FEISHU_BOT_OPEN_ID`; without it
+  the bot conservatively skips history loading and logs once at INFO.
+- **Filter** — keeps only messages where the sender is the current user
+  or the bot (`history_filter=self_and_bot`); side chatter from other
+  group members is dropped.
+- **Window** — most recent `FEISHU_HISTORY_COUNT` messages (default
+  `20`, Feishu caps at 50) within the last `FEISHU_HISTORY_WINDOW_MINUTES`
+  minutes (default `60`; set `0` for no time limit).
+- **Images in history** — only included when `T2T_MULTIMODAL=1` (the
+  T2T chat endpoint must accept `image_url` message parts). When unset,
+  historical images are dropped and a single WARNING is emitted listing
+  how many were skipped. The hard cap is `FEISHU_HISTORY_MAX_IMAGES`
+  (default `3`), counted across history newest-first.
+- **`t2i` / `it2i`** — the Images API has no multi-turn shape, so the
+  history is folded into the prompt as a plaintext `Conversation
+  context: … Current request: …` prefix.
+- **Failure modes** — any failure loading history (missing scope,
+  network blip, etc.) degrades silently to "no history" so the primary
+  reply path is never broken.
+
+Disable entirely with `FEISHU_HISTORY_ENABLED=0`.
+
 ## Configuration
 
 All configuration is via environment variables (a `.env` file is auto-loaded
@@ -140,10 +176,19 @@ if present). See `.env.example`.
 | Var | Default | Purpose |
 |---|---|---|
 | `FEISHU_RESPOND_MODE` | `all` | `all` or `mentions_or_p2p`. |
-| `FEISHU_BOT_OPEN_ID` | — | Required only if `FEISHU_RESPOND_MODE=mentions_or_p2p`. |
+| `FEISHU_BOT_OPEN_ID` | — | Required for `mentions_or_p2p` *and* for reliable history loading in groups (used to detect bot @-mentions). |
 | `FEISHU_WORKER_THREADS` | `4` | Worker pool size for LLM calls. |
 | `FEISHU_DEDUP_CAPACITY` | `1024` | LRU size for `event_id` dedup. |
 | `FEISHU_DEBUG` | — | Set to `1` for verbose SDK logs. |
+
+### Conversation history (optional)
+| Var | Default | Purpose |
+|---|---|---|
+| `FEISHU_HISTORY_ENABLED` | `1` | Kill switch. Set to `0` to disable history loading. |
+| `FEISHU_HISTORY_COUNT` | `20` | Max recent messages to include (Feishu caps at 50). |
+| `FEISHU_HISTORY_WINDOW_MINUTES` | `60` | Only include messages from the last N minutes. `0` = unlimited. |
+| `FEISHU_HISTORY_MAX_IMAGES` | `3` | Hard cap on history images included in the LLM call (newest-first). Ignored when `T2T_MULTIMODAL` is not set. |
+| `T2T_MULTIMODAL` | `0` | Set to `1` if the T2T endpoint accepts `image_url` parts. Required to feed historical images to the LLM. When unset, history images are dropped and a WARNING is logged. |
 
 ### `run` mode
 | Var | Purpose |
@@ -172,7 +217,9 @@ minial-agent/
 │   ├── __main__.py    # CLI entry  (`minimal-agent run | serve`)
 │   ├── agent.py       # routing + dispatch (run + handle_feishu_event)
 │   ├── tools.py       # the four LLM capability functions
-│   ├── feishu.py      # thin lark-oapi wrappers (send/reply/upload/download)
+│   ├── feishu.py      # thin lark-oapi wrappers (send/reply/upload/download/list)
+│   ├── history.py     # builds OpenAI chat history from Feishu messages
+│   ├── _messages.py   # shared Feishu message-content parsers
 │   ├── bot.py         # long-connection bot (lark.ws.Client + worker pool)
 │   ├── start-lark.sh  # convenience wrapper around `uv run minimal-agent serve`
 │   └── lark-samples-main/  # reference samples from Feishu (read-only)

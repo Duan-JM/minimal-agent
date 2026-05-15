@@ -76,31 +76,49 @@ back-compat shim that rewrites `minimal-agent "prompt"` to
    - `run(prompt, image_path, mode, output_dir, notify_feishu, chat_id)` —
      the one-shot dispatch used by the `run` CLI; returns a `ToolResult`.
    - `handle_feishu_event(...)` — called by the bot worker pool for each
-     deduped event.
+     deduped event. Accepts an optional ``history`` (``HistoryResult``)
+     to pass conversation context into the tools layer.
    - `VALID_TOOLS`, `IMAGE_GEN_KEYWORDS`, `IMAGE_EDIT_KEYWORDS`,
      `DEFAULT_IMAGE_ONLY_PROMPT` — the keyword router’s source of truth.
 
 2. **`app/tools.py`** — the four LLM capability functions, split across two
    endpoints:
    - Text-only chat endpoint (`T2T_*` env vars): `t2t`, `it2t` (VQA) via
-     `POST /v1/chat/completions`.
+     `POST /v1/chat/completions`. Both accept an optional ``history`` list
+     of OpenAI chat messages prepended before the current turn.
    - Multimodal images endpoint (`OPENAI_*` env vars): `t2i` via
      `POST /v1/images/generations`, `it2i` via `POST /v1/images/edits`
-     (multipart).
+     (multipart). Both accept ``history_text_prefix``, folded into the
+     prompt string (Images API doesn't support multi-turn).
    - `_extract_text` strips the model’s leading `<think>…</think>` block
      before returning user-facing text.
 
 3. **`app/feishu.py`** — thin wrappers over `lark.Client.im.v1`:
    `reply_text` / `reply_image`, `send_text` / `send_image`,
-   `download_message_resource`, `upload_image`. Raises `FeishuError` on
-   non-success API responses. The SDK handles tenant-token caching, signing,
-   and retry — never touch raw HTTP from here.
+   `download_message_resource`, `upload_image`, `get_message`,
+   `list_chat_messages` (newest-first paginated history,
+   reversed to oldest→newest before return). Raises `FeishuError` on
+   non-success API responses. The SDK handles tenant-token caching,
+   signing, and retry — never touch raw HTTP from here.
 
-4. **`app/bot.py`** — long-connection bot. Wires up `lark.ws.Client`, dedups
+4. **`app/history.py`** — folds Feishu ``Message`` lists into a
+   ``HistoryResult`` (OpenAI ``chat_messages`` + text ``text_summary`` for
+   image-gen tools, plus include/skip image counts). Controls multimodal
+   inclusion via the caller's ``include_images`` flag.
+
+5. **`app/_messages.py`** — shared message-content parsers (text /
+   image / post) reused by both `bot.py` and `history.py` to avoid an
+   ``app.bot`` ⇄ ``app.history`` import cycle.
+
+6. **`app/bot.py`** — long-connection bot. Wires up `lark.ws.Client`, dedups
    events by `event_id` (LRU), offloads slow LLM/image work to a bounded
    `ThreadPoolExecutor`, and replies in-thread with `uuid = "{event_id}:{tool}"`
    for idempotency. Also resolves quoted-image replies by fetching the parent
-   message and downloading its picture.
+   message and downloading its picture. When the bot is engaged (P2P or
+   @-mentioned in a group) the worker loads recent chat history via
+   ``feishu.list_chat_messages`` and ``history.build_history`` and passes
+   the resulting ``HistoryResult`` to ``agent.handle_feishu_event``. All
+   history failures degrade silently to "no history".
 
 **Other top-level files:**
 
@@ -118,9 +136,12 @@ back-compat shim that rewrites `minimal-agent "prompt"` to
   auto-loaded by `python-dotenv` in `main()`. See `.env.example` and the
   Configuration table in `README.md` for the full list — required:
   `FEISHU_APP_ID`, `FEISHU_APP_SECRET`. Common: `OPENAI_BASE_URL`,
-  `OPENAI_API_KEY`, `OPENAI_MODEL`, `T2T_*`, `FEISHU_CHAT_ID`,
-  `FEISHU_RESPOND_MODE`, `FEISHU_BOT_OPEN_ID`, `FEISHU_WORKER_THREADS`,
-  `FEISHU_DEDUP_CAPACITY`, `OUTPUT_DIR`, `ENABLE_LLM_ROUTER`, `LLM_TIMEOUT`.
+  `OPENAI_API_KEY`, `OPENAI_MODEL`, `T2T_*`, `T2T_MULTIMODAL`,
+  `FEISHU_CHAT_ID`, `FEISHU_RESPOND_MODE`, `FEISHU_BOT_OPEN_ID`,
+  `FEISHU_WORKER_THREADS`, `FEISHU_DEDUP_CAPACITY`,
+  `FEISHU_HISTORY_ENABLED`, `FEISHU_HISTORY_COUNT`,
+  `FEISHU_HISTORY_WINDOW_MINUTES`, `FEISHU_HISTORY_MAX_IMAGES`,
+  `OUTPUT_DIR`, `ENABLE_LLM_ROUTER`, `LLM_TIMEOUT`.
 - **No persistent storage**: no database, no cache, no broker. State is
   in-process (LRU dedup set, thread pool).
 - **Service architecture**:
