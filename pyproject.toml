@@ -19,6 +19,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+# `app/lark-samples-main/` is upstream Feishu reference material that
+# AGENTS.md treats as read-only and is never imported. Excluding it
+# trims ~21 MB / 266 files from the built wheel.
+exclude = ["app/lark-samples-main/**"]
+include = ["app/py.typed"]
 
 [dependency-groups]
 dev = []
