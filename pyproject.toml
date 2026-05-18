@@ -35,6 +35,7 @@ dependencies = [
     "requests>=2.31",
     "python-dotenv>=1.0",
     "lark-oapi>=1.4.8",
+    "structlog>=24.1",
 ]
 
 [project.urls]

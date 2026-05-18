@@ -595,6 +595,7 @@ class BotHistoryWorkerTests(unittest.TestCase):
 
     def test_multimodal_off_with_history_images_warns(self):
         from app import bot as bot_mod
+        from structlog.testing import capture_logs
         bot = self._make_bot(t2t_multimodal=False)
         evt = _make_event(content={"text": "what about that pic?"})
         history_items = [
@@ -605,16 +606,21 @@ class BotHistoryWorkerTests(unittest.TestCase):
                                return_value=history_items), \
              mock.patch.object(bot_mod.feishu, "download_message_resource") as dl, \
              mock.patch.object(bot_mod.agent, "handle_feishu_event"), \
-             mock.patch("sys.stderr") as stderr:
+             capture_logs() as cap_logs:
             bot._dispatch(evt)
         # Bot must NOT download history images when multimodal is off — it's
         # wasted bandwidth.
         dl.assert_not_called()
-        # And it must log a WARNING naming the skipped image.
-        printed = "".join(call.args[0] for call in stderr.write.call_args_list
-                          if call.args and isinstance(call.args[0], str))
-        self.assertIn("WARNING", printed)
-        self.assertIn("T2T_MULTIMODAL", printed)
+        # And it must log a structured warning naming T2T_MULTIMODAL.
+        skip_events = [
+            e for e in cap_logs
+            if e.get("event") == "history.images_skipped_no_multimodal"
+        ]
+        self.assertTrue(skip_events, f"no skip event found in {cap_logs!r}")
+        evt_log = skip_events[0]
+        self.assertEqual(evt_log.get("log_level"), "warning")
+        self.assertGreater(evt_log.get("skipped", 0), 0)
+        self.assertIn("T2T_MULTIMODAL", evt_log.get("hint", ""))
 
     def test_multimodal_on_downloads_history_images(self):
         from app import bot as bot_mod

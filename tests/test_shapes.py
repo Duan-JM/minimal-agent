@@ -1136,7 +1136,11 @@ class CLITests(unittest.TestCase):
             return agent.AgentResult(tool="t2t", text="ok", image_path=None,
                                      feishu_pushed=False)
 
-        with mock.patch("app.__main__.run", side_effect=fake_run):
+        # Stub out ``configure_logging`` so this test doesn't replace our
+        # quiet test-time structlog config with the production setup
+        # (which would leak log lines into the rest of the test run).
+        with mock.patch("app.__main__.run", side_effect=fake_run), \
+             mock.patch("app.__main__.configure_logging"):
             rc = cli.main(["my prompt", "--mode", "t2t", "--no-feishu"])
         self.assertEqual(rc, 0)
         self.assertEqual(captured["prompt"], "my prompt")

@@ -29,10 +29,16 @@ import json
 import mimetypes
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
+
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -115,17 +121,56 @@ def _post_chat(
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
     }
+    log.debug(
+        "tools.chat.request",
+        url=url,
+        model=payload.get("model"),
+        messages_count=len(payload.get("messages") or []),
+        has_tools=bool(payload.get("tools")),
+        max_tokens=payload.get("max_tokens"),
+        temperature=payload.get("temperature"),
+        stream=payload.get("stream"),
+    )
+    started = time.monotonic()
     resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     if resp.status_code >= 400:
+        log.error(
+            "tools.chat.http_error",
+            url=url,
+            status=resp.status_code,
+            elapsed_ms=elapsed_ms,
+            body_preview=resp.text[:500],
+        )
         raise RuntimeError(
             f"LLM HTTP {resp.status_code} from {url}: {resp.text[:500]}"
         )
     try:
         data = resp.json()
     except ValueError as e:
+        log.error(
+            "tools.chat.non_json_response",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            body_preview=resp.text[:500],
+        )
         raise RuntimeError(f"LLM returned non-JSON response: {resp.text[:500]}") from e
     if isinstance(data, dict) and data.get("error"):
+        log.error(
+            "tools.chat.api_error",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            error=data["error"],
+        )
         raise RuntimeError(f"LLM API error: {data['error']}")
+    log.debug(
+        "tools.chat.response",
+        url=url,
+        status=resp.status_code,
+        elapsed_ms=elapsed_ms,
+        response_bytes=len(resp.content),
+        choices=len(data.get("choices") or []) if isinstance(data, dict) else 0,
+    )
     return data
 
 
@@ -435,18 +480,55 @@ def t2i(
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
     }
+    log.debug(
+        "tools.t2i.request",
+        url=url,
+        size=body["size"],
+        seed=seed,
+        prompt_chars=len(final_prompt),
+        has_history=bool(history_text_prefix),
+    )
+    started = time.monotonic()
     r = requests.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     if r.status_code >= 400:
+        log.error(
+            "tools.t2i.http_error",
+            url=url,
+            status=r.status_code,
+            elapsed_ms=elapsed_ms,
+            body_preview=r.text[:500],
+        )
         raise RuntimeError(
             f"Images API HTTP {r.status_code} from {url}: {r.text[:500]}"
         )
     try:
         data = r.json()
     except ValueError as e:
+        log.error(
+            "tools.t2i.non_json_response",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            body_preview=r.text[:500],
+        )
         raise RuntimeError(f"Images API non-JSON response: {r.text[:500]}") from e
     if isinstance(data, dict) and data.get("error"):
+        log.error(
+            "tools.t2i.api_error",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            error=data["error"],
+        )
         raise RuntimeError(f"Images API error: {data['error']}")
-    return _decode_b64_image(data)
+    image_bytes = _decode_b64_image(data)
+    log.debug(
+        "tools.t2i.response",
+        url=url,
+        status=r.status_code,
+        elapsed_ms=elapsed_ms,
+        image_bytes=len(image_bytes),
+    )
+    return image_bytes
 
 
 def it2i(
@@ -478,19 +560,57 @@ def it2i(
         "output_format": output_format,
     }
     headers = {"Authorization": f"Bearer {cfg['api_key']}"}
+    log.debug(
+        "tools.it2i.request",
+        url=url,
+        size=form["size"],
+        output_format=output_format,
+        prompt_chars=len(final_prompt),
+        has_history=bool(history_text_prefix),
+        image_bytes=len(files["image"][1]),
+    )
+    started = time.monotonic()
     r = requests.post(
         url, files=files, data=form, headers=headers, timeout=DEFAULT_TIMEOUT
     )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     if r.status_code >= 400:
+        log.error(
+            "tools.it2i.http_error",
+            url=url,
+            status=r.status_code,
+            elapsed_ms=elapsed_ms,
+            body_preview=r.text[:500],
+        )
         raise RuntimeError(
             f"Images Edits API HTTP {r.status_code} from {url}: {r.text[:500]}"
         )
     try:
         data = r.json()
     except ValueError as e:
+        log.error(
+            "tools.it2i.non_json_response",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            body_preview=r.text[:500],
+        )
         raise RuntimeError(
             f"Images Edits API non-JSON response: {r.text[:500]}"
         ) from e
     if isinstance(data, dict) and data.get("error"):
+        log.error(
+            "tools.it2i.api_error",
+            url=url,
+            elapsed_ms=elapsed_ms,
+            error=data["error"],
+        )
         raise RuntimeError(f"Images Edits API error: {data['error']}")
-    return _decode_b64_image(data)
+    image_bytes = _decode_b64_image(data)
+    log.debug(
+        "tools.it2i.response",
+        url=url,
+        status=r.status_code,
+        elapsed_ms=elapsed_ms,
+        image_bytes=len(image_bytes),
+    )
+    return image_bytes

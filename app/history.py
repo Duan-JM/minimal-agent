@@ -25,6 +25,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ._messages import parse_fetched_message
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -171,10 +175,14 @@ def build_history(
     image_bytes_by_key = image_bytes_by_key or {}
     summary_lines: list[str] = []
     images_used = 0
+    dropped_filter = 0
+    dropped_empty = 0
+    dropped_skipped = 0
 
     for msg in messages:
         message_id = getattr(msg, "message_id", None)
         if message_id and message_id in skip:
+            dropped_skipped += 1
             continue
 
         sender_open_id = _extract_sender_open_id(msg)
@@ -185,10 +193,12 @@ def build_history(
             bot_open_id=bot_open_id,
             filter_mode=filter_mode,
         ):
+            dropped_filter += 1
             continue
 
         text, image_keys = parse_fetched_message(msg)
         if not text and not image_keys:
+            dropped_empty += 1
             continue
 
         role = _role_for(msg, sender_open_id, bot_open_id)
@@ -234,4 +244,18 @@ def build_history(
             summary_lines.append(f"[{role}]: {summary_text}")
 
     result.text_summary = "\n".join(summary_lines)
+    log.debug(
+        "history.build.done",
+        input_count=len(messages),
+        kept=len(result.chat_messages),
+        dropped_filter=dropped_filter,
+        dropped_empty=dropped_empty,
+        dropped_skipped=dropped_skipped,
+        images_total=result.image_count_total,
+        images_included=result.image_count_included,
+        images_skipped_no_multimodal=result.image_count_skipped_no_multimodal,
+        filter_mode=filter_mode,
+        include_images=include_images,
+        text_summary_chars=len(result.text_summary),
+    )
     return result

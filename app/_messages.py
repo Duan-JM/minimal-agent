@@ -13,6 +13,11 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
+
 
 MENTION_PLACEHOLDER_PREFIX = "@_user_"
 
@@ -30,7 +35,13 @@ def parse_message_content(
         return "", []
     try:
         data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as exc:
+        log.debug(
+            "messages.parse.invalid_json",
+            msg_type=msg_type,
+            error=str(exc),
+            content_preview=(content[:120] if isinstance(content, str) else None),
+        )
         return "", []
 
     if msg_type == "text":
@@ -57,6 +68,7 @@ def parse_message_content(
                         image_keys.append(k)
         return " ".join(text_parts).strip(), image_keys
 
+    log.debug("messages.parse.unsupported_type", msg_type=msg_type)
     return "", []
 
 
