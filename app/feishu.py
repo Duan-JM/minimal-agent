@@ -26,6 +26,7 @@ import io
 import json
 import os
 import threading
+import time
 from typing import Optional
 
 import lark_oapi as lark
@@ -40,6 +41,11 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
 
 
 class FeishuError(RuntimeError):
@@ -93,9 +99,17 @@ def _check(resp, op: str) -> None:
             log_id = resp.get_log_id() or ""
         except Exception:  # noqa: BLE001
             pass
+        log.error(
+            "feishu.api_error",
+            op=op,
+            code=resp.code,
+            msg=resp.msg,
+            log_id=log_id,
+        )
         raise FeishuError(
             f"feishu {op} failed: code={resp.code} msg={resp.msg!r} log_id={log_id}"
         )
+    log.debug("feishu.api_ok", op=op, code=getattr(resp, "code", None))
 
 
 def _safe_uuid(*parts: str, max_len: int = 50) -> str:
@@ -116,6 +130,12 @@ def _safe_uuid(*parts: str, max_len: int = 50) -> str:
 # ---------------------------------------------------------------------------
 
 def reply_text(message_id: str, text: str, *, uuid: Optional[str] = None) -> None:
+    log.debug(
+        "feishu.reply_text.start",
+        message_id=message_id,
+        chars=len(text or ""),
+        has_uuid=bool(uuid),
+    )
     body_builder = ReplyMessageRequestBody.builder().content(
         json.dumps({"text": text}, ensure_ascii=False)
     ).msg_type("text")
@@ -127,11 +147,25 @@ def reply_text(message_id: str, text: str, *, uuid: Optional[str] = None) -> Non
         .request_body(body_builder.build())
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message.reply(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.reply(text)")
+    log.info(
+        "feishu.reply_text.ok",
+        message_id=message_id,
+        chars=len(text or ""),
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def reply_image(message_id: str, image_bytes: bytes, *, uuid: Optional[str] = None) -> str:
+    log.debug(
+        "feishu.reply_image.start",
+        message_id=message_id,
+        size_bytes=len(image_bytes) if image_bytes else 0,
+        has_uuid=bool(uuid),
+    )
     image_key = upload_image(image_bytes)
     body_builder = ReplyMessageRequestBody.builder().content(
         json.dumps({"image_key": image_key}, ensure_ascii=False)
@@ -144,8 +178,17 @@ def reply_image(message_id: str, image_bytes: bytes, *, uuid: Optional[str] = No
         .request_body(body_builder.build())
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message.reply(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.reply(image)")
+    log.info(
+        "feishu.reply_image.ok",
+        message_id=message_id,
+        image_key=image_key,
+        size_bytes=len(image_bytes),
+        elapsed_ms=elapsed_ms,
+    )
     return image_key
 
 
@@ -155,6 +198,13 @@ def reply_image(message_id: str, image_bytes: bytes, *, uuid: Optional[str] = No
 
 def send_text(receive_id: str, text: str, *, receive_id_type: str = "chat_id",
               uuid: Optional[str] = None) -> None:
+    log.debug(
+        "feishu.send_text.start",
+        receive_id=receive_id,
+        receive_id_type=receive_id_type,
+        chars=len(text or ""),
+        has_uuid=bool(uuid),
+    )
     body_builder = (
         CreateMessageRequestBody.builder()
         .receive_id(receive_id)
@@ -169,12 +219,27 @@ def send_text(receive_id: str, text: str, *, receive_id_type: str = "chat_id",
         .request_body(body_builder.build())
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message.create(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.create(text)")
+    log.info(
+        "feishu.send_text.ok",
+        receive_id=receive_id,
+        chars=len(text or ""),
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def send_image(receive_id: str, image_bytes: bytes, *, receive_id_type: str = "chat_id",
                uuid: Optional[str] = None) -> str:
+    log.debug(
+        "feishu.send_image.start",
+        receive_id=receive_id,
+        receive_id_type=receive_id_type,
+        size_bytes=len(image_bytes) if image_bytes else 0,
+        has_uuid=bool(uuid),
+    )
     image_key = upload_image(image_bytes)
     body_builder = (
         CreateMessageRequestBody.builder()
@@ -190,8 +255,17 @@ def send_image(receive_id: str, image_bytes: bytes, *, receive_id_type: str = "c
         .request_body(body_builder.build())
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message.create(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.create(image)")
+    log.info(
+        "feishu.send_image.ok",
+        receive_id=receive_id,
+        image_key=image_key,
+        size_bytes=len(image_bytes),
+        elapsed_ms=elapsed_ms,
+    )
     return image_key
 
 
@@ -201,6 +275,12 @@ def send_image(receive_id: str, image_bytes: bytes, *, receive_id_type: str = "c
 
 def download_message_resource(message_id: str, file_key: str, *, type_: str = "image") -> bytes:
     """Download an image (or file) attached to a received message."""
+    log.debug(
+        "feishu.download_resource.start",
+        message_id=message_id,
+        file_key=file_key,
+        type=type_,
+    )
     req = (
         GetMessageResourceRequest.builder()
         .message_id(message_id)
@@ -208,15 +288,31 @@ def download_message_resource(message_id: str, file_key: str, *, type_: str = "i
         .type(type_)
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message_resource.get(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message_resource.get")
     if resp.file is None:
+        log.error(
+            "feishu.download_resource.no_file",
+            message_id=message_id,
+            file_key=file_key,
+        )
         raise FeishuError(
             f"feishu message_resource.get returned no file (message_id={message_id}, "
             f"file_key={file_key})"
         )
     try:
-        return resp.file.read()
+        payload = resp.file.read()
+        log.info(
+            "feishu.download_resource.ok",
+            message_id=message_id,
+            file_key=file_key,
+            type=type_,
+            size_bytes=len(payload),
+            elapsed_ms=elapsed_ms,
+        )
+        return payload
     finally:
         try:
             resp.file.close()
@@ -250,6 +346,13 @@ def list_chat_messages(
     if not chat_id:
         raise FeishuError("list_chat_messages: chat_id is required")
     page_size = max(1, min(int(count), 50))  # Feishu caps page_size at 50.
+    log.debug(
+        "feishu.list_messages.start",
+        chat_id=chat_id,
+        page_size=page_size,
+        start_time_seconds=start_time_seconds,
+        sort_desc=sort_desc,
+    )
     builder = (
         ListMessageRequest.builder()
         .container_id_type("chat")
@@ -260,12 +363,20 @@ def list_chat_messages(
     if start_time_seconds is not None and start_time_seconds > 0:
         builder = builder.start_time(str(int(start_time_seconds)))
     req = builder.build()
+    started = time.monotonic()
     resp = get_client().im.v1.message.list(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.list")
     items = getattr(resp.data, "items", None) if resp.data is not None else None
     items = list(items or [])
     if sort_desc:
         items.reverse()  # oldest → newest for downstream conversation building.
+    log.info(
+        "feishu.list_messages.ok",
+        chat_id=chat_id,
+        count=len(items),
+        elapsed_ms=elapsed_ms,
+    )
     return items
 
 
@@ -278,18 +389,31 @@ def get_message(message_id: str):
     Raises :class:`FeishuError` on API failure or empty result. Callers should
     catch it and degrade gracefully (the user can still get a text reply).
     """
+    log.debug("feishu.get_message.start", message_id=message_id)
     req = (
         GetMessageRequest.builder()
         .message_id(message_id)
         .build()
     )
+    started = time.monotonic()
     resp = get_client().im.v1.message.get(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "message.get")
     items = getattr(resp.data, "items", None) if resp.data is not None else None
     if not items:
+        log.error(
+            "feishu.get_message.empty",
+            message_id=message_id,
+            elapsed_ms=elapsed_ms,
+        )
         raise FeishuError(
             f"feishu message.get returned no items (message_id={message_id})"
         )
+    log.info(
+        "feishu.get_message.ok",
+        message_id=message_id,
+        elapsed_ms=elapsed_ms,
+    )
     return items[0]
 
 
@@ -319,6 +443,11 @@ def upload_image(image_bytes: bytes, *, file_name: Optional[str] = None) -> str:
     if not image_bytes:
         raise FeishuError("upload_image: image_bytes is empty")
     name = file_name or f"image.{_detect_image_ext(image_bytes)}"
+    log.debug(
+        "feishu.upload_image.start",
+        size_bytes=len(image_bytes),
+        file_name=name,
+    )
     bio = io.BytesIO(image_bytes)
     bio.name = name
     body = (
@@ -328,9 +457,23 @@ def upload_image(image_bytes: bytes, *, file_name: Optional[str] = None) -> str:
         .build()
     )
     req = CreateImageRequest.builder().request_body(body).build()
+    started = time.monotonic()
     resp = get_client().im.v1.image.create(req)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     _check(resp, "image.create")
     image_key = getattr(resp.data, "image_key", None) if resp.data is not None else None
     if not image_key:
+        log.error(
+            "feishu.upload_image.empty_key",
+            file_name=name,
+            elapsed_ms=elapsed_ms,
+        )
         raise FeishuError("feishu image.create returned empty image_key")
+    log.info(
+        "feishu.upload_image.ok",
+        file_name=name,
+        size_bytes=len(image_bytes),
+        image_key=image_key,
+        elapsed_ms=elapsed_ms,
+    )
     return image_key

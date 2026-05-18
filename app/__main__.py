@@ -24,6 +24,10 @@ except ImportError:  # pragma: no cover
         return False
 
 from .agent import VALID_TOOLS, run
+from .log_config import configure_logging, get_logger
+
+
+log = get_logger(__name__)
 
 
 def _add_run_args(p: argparse.ArgumentParser) -> None:
@@ -95,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch_run(args) -> int:
+    log.debug(
+        "cli.run.start",
+        has_image=bool(args.image),
+        mode=args.mode,
+        output_dir=args.output_dir,
+        no_feishu=args.no_feishu,
+        chat_id_override=bool(args.chat_id),
+        prompt_len=len(args.prompt or ""),
+    )
     try:
         result = run(
             prompt=args.prompt,
@@ -105,36 +118,55 @@ def _dispatch_run(args) -> int:
             chat_id=args.chat_id,
         )
     except FileNotFoundError as e:
+        log.error("cli.run.input_missing", error=str(e))
         print(f"error: {e}", file=sys.stderr)
         return 2
     except ValueError as e:
+        log.error("cli.run.invalid_args", error=str(e))
         print(f"error: {e}", file=sys.stderr)
         return 2
     except Exception as e:  # noqa: BLE001
+        log.exception("cli.run.unhandled_error", error=str(e))
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     if not args.no_feishu and not result.feishu_pushed:
+        log.warning(
+            "cli.run.feishu_delivery_failed",
+            tool=result.tool,
+            reason=result.feishu_error,
+        )
         print(
             "warning: result computed locally but Feishu delivery failed; "
             f"reason: {result.feishu_error}",
             file=sys.stderr,
         )
         return 3
+    log.info(
+        "cli.run.done",
+        tool=result.tool,
+        feishu_pushed=result.feishu_pushed,
+        has_text=result.text is not None,
+        image_path=result.image_path,
+    )
     return 0
 
 
 def _dispatch_serve(args) -> int:  # noqa: ARG001
     # Import lazily so `run` doesn't import the SDK's WebSocket stack.
     from .bot import start as _start
+    log.debug("cli.serve.start")
     try:
         _start()
     except SystemExit as e:
+        log.error("cli.serve.systemexit", error=str(e))
         print(f"error: {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
+        log.info("cli.serve.keyboard_interrupt")
         return 0
     except Exception as e:  # noqa: BLE001
+        log.exception("cli.serve.bot_connection_failed", error=str(e))
         print(f"error: bot connection failed: {e}", file=sys.stderr)
         return 1
     return 0
@@ -142,6 +174,10 @@ def _dispatch_serve(args) -> int:  # noqa: ARG001
 
 def main(argv=None) -> int:
     load_dotenv()
+    # ``configure_logging`` must run *after* ``load_dotenv`` so that
+    # ``LOG_LEVEL`` / ``LOG_FORMAT`` / ``FEISHU_DEBUG`` defined in the
+    # user's ``.env`` are honored on the very first log line.
+    configure_logging()
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Back-compat shim: if the first non-flag token is neither "run" nor
@@ -150,6 +186,7 @@ def main(argv=None) -> int:
         argv = ["run", *argv]
 
     args = build_parser().parse_args(argv)
+    log.debug("cli.dispatch", cmd=args.cmd or "run")
 
     if args.cmd == "serve":
         return _dispatch_serve(args)

@@ -18,9 +18,7 @@ attempts a best-effort short error reply so the user isn't left hanging.
 """
 from __future__ import annotations
 
-import json
 import os
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -29,6 +27,10 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
 from . import _messages, agent, feishu, history as history_mod
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
 
 
 DEFAULT_RESPOND_MODE = "all"  # Feishu only delivers @-mentioned msgs in groups by default.
@@ -157,10 +159,16 @@ class Bot:
             event_handler=handler,
             log_level=self._log_level,
         )
-        print(
-            f"[bot] connecting to Feishu (respond_mode={self.respond_mode}, "
-            f"workers={self._executor._max_workers})",
-            file=sys.stderr,
+        log.info(
+            "bot.connect",
+            respond_mode=self.respond_mode,
+            workers=self._executor._max_workers,
+            history_enabled=self.history_enabled,
+            history_count=self.history_count,
+            history_window_minutes=self.history_window_minutes,
+            history_max_images=self.history_max_images,
+            t2t_multimodal=self.t2t_multimodal,
+            sdk_log_level=str(self._log_level),
         )
         # Blocks until the long connection is torn down.
         ws_client.start()
@@ -172,7 +180,7 @@ class Bot:
             self._dispatch(data)
         except Exception as e:  # noqa: BLE001
             # Never propagate into the SDK loop.
-            print(f"[bot] dispatch error: {e}", file=sys.stderr)
+            log.exception("bot.dispatch_error", error=str(e))
 
     def _dispatch(self, data: P2ImMessageReceiveV1) -> None:
         event_id = getattr(data.header, "event_id", None) if data.header else None
@@ -182,13 +190,18 @@ class Bot:
         # Filter out the bot's own messages / system messages.
         sender_type = getattr(sender, "sender_type", None)
         if sender_type and sender_type != "user":
+            log.debug(
+                "bot.skip_non_user_sender",
+                sender_type=sender_type,
+                event_id=event_id,
+            )
             return
 
         # Dedup. The SDK may redeliver on reconnect; replies are idempotent at
         # the Feishu API layer via the message uuid, but doing the LLM work
         # twice is wasteful and user-visible.
         if event_id and not self._dedup.add(event_id):
-            print(f"[bot] dedup hit, skipping event_id={event_id}", file=sys.stderr)
+            log.info("bot.dedup_hit", event_id=event_id)
             return
 
         text, image_keys = _parse_content(message)
@@ -199,15 +212,35 @@ class Bot:
         # and only when the current message lacks an inline image.
         parent_id = getattr(message, "parent_id", None) or None
 
+        log.debug(
+            "bot.message_received",
+            event_id=event_id,
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            chat_type=getattr(message, "chat_type", None),
+            message_type=message.message_type,
+            text_chars=len(text or ""),
+            image_count=len(image_keys),
+            has_parent=bool(parent_id),
+            mention_count=len(message.mentions or []),
+        )
+
         if not text and not image_keys and not parent_id:
-            print(
-                f"[bot] message_type={message.message_type} has no text/images and "
-                f"no quoted parent; ignoring",
-                file=sys.stderr,
+            log.info(
+                "bot.ignore_empty",
+                message_type=message.message_type,
+                event_id=event_id,
+                message_id=message.message_id,
             )
             return
 
         if not self._should_respond(message):
+            log.debug(
+                "bot.respond_gate.skip",
+                respond_mode=self.respond_mode,
+                chat_type=getattr(message, "chat_type", None),
+                message_id=message.message_id,
+            )
             return
 
         # Capture extra context for history loading (sender, chat type,
@@ -218,6 +251,15 @@ class Bot:
         is_mentioned = self._was_bot_mentioned(message)
 
         # Hand off to a worker thread so the asyncio loop stays free.
+        log.debug(
+            "bot.worker_submit",
+            event_id=event_id,
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            chat_type=chat_type,
+            is_mentioned=is_mentioned,
+            sender_open_id=sender_open_id,
+        )
         self._executor.submit(
             self._process,
             event_id=event_id,
@@ -259,10 +301,11 @@ class Bot:
         if not self.bot_open_id:
             # Without a known bot id we can't distinguish a bot mention; be
             # permissive but log so the operator can supply FEISHU_BOT_OPEN_ID.
-            print(
-                "[bot] respond_mode=mentions_or_p2p but FEISHU_BOT_OPEN_ID is unset; "
-                "replying anyway",
-                file=sys.stderr,
+            log.warning(
+                "bot.respond_gate.bot_open_id_missing",
+                respond_mode=self.respond_mode,
+                chat_type=message.chat_type,
+                action="reply_anyway",
             )
             return True
         for m in (message.mentions or []):
@@ -283,6 +326,15 @@ class Bot:
         image_bytes: Optional[bytes] = None
         image_source_id = message_id
         quoted_image_failure: Optional[str] = None
+        log.debug(
+            "bot.process.start",
+            event_id=event_id,
+            message_id=message_id,
+            chat_id=chat_id,
+            text_chars=len(text or ""),
+            image_keys=image_keys,
+            parent_id=parent_id,
+        )
         try:
             # 1) If no inline image but the user quoted another message, try to
             #    fetch the parent and use *its* image so "改成黑白" + quoted pic
@@ -294,18 +346,30 @@ class Bot:
 
             # 2) Download the image bytes (if any).
             if image_keys:
+                log.debug(
+                    "bot.process.download_image",
+                    source_message_id=image_source_id,
+                    image_key=image_keys[0],
+                )
                 try:
                     image_bytes = feishu.download_message_resource(
                         image_source_id, image_keys[0], type_="image"
+                    )
+                    log.debug(
+                        "bot.process.download_image.ok",
+                        source_message_id=image_source_id,
+                        image_key=image_keys[0],
+                        size_bytes=len(image_bytes) if image_bytes else 0,
                     )
                 except feishu.FeishuError as e:
                     # Distinguish download failure from parent-lookup failure
                     # — we successfully *found* the picture, just can't read
                     # it, so tell the user instead of silently degrading.
-                    print(
-                        f"[bot] failed to download quoted image "
-                        f"(source={image_source_id}, key={image_keys[0]}): {e}",
-                        file=sys.stderr,
+                    log.error(
+                        "bot.process.download_image.failed",
+                        source_message_id=image_source_id,
+                        image_key=image_keys[0],
+                        error=str(e),
                     )
                     if image_source_id != message_id:
                         feishu.reply_text(
@@ -321,13 +385,19 @@ class Bot:
                 # Parent lookup failed and no other image available — fall
                 # through to text-only handling but make sure we have *some*
                 # prompt to work with.
-                print(
-                    f"[bot] quoted parent lookup failed: {quoted_image_failure}",
-                    file=sys.stderr,
+                log.warning(
+                    "bot.process.quoted_parent_lookup_failed",
+                    parent_id=parent_id,
+                    reason=quoted_image_failure,
                 )
 
             if not text and image_bytes is None:
                 # Nothing actionable — skip silently rather than spamming.
+                log.debug(
+                    "bot.process.nothing_actionable",
+                    event_id=event_id,
+                    message_id=message_id,
+                )
                 return
 
             # 3) Optional: load recent chat history as conversation context.
@@ -347,8 +417,18 @@ class Bot:
                 event_id=event_id,
                 history=history_result,
             )
+            log.debug(
+                "bot.process.done",
+                event_id=event_id,
+                message_id=message_id,
+            )
         except Exception as e:  # noqa: BLE001
-            print(f"[bot] worker error processing {event_id}: {e}", file=sys.stderr)
+            log.exception(
+                "bot.process.worker_error",
+                event_id=event_id,
+                message_id=message_id,
+                error=str(e),
+            )
             self._safe_error_reply(message_id, event_id, e)
 
     # -- history loading ----------------------------------------------------
@@ -369,10 +449,9 @@ class Bot:
             return True
         if chat_type and chat_type != "p2p":
             if not self.bot_open_id:
-                print(
-                    "[history] skipping in group: FEISHU_BOT_OPEN_ID unset, "
-                    "cannot reliably detect bot mention",
-                    file=sys.stderr,
+                log.info(
+                    "history.skip_group_no_bot_open_id",
+                    chat_type=chat_type,
                 )
                 return False
             return is_mentioned
@@ -396,6 +475,12 @@ class Bot:
         if not self._should_load_history(
             chat_type=chat_type, is_mentioned=is_mentioned
         ):
+            log.debug(
+                "history.skip_ineligible",
+                chat_type=chat_type,
+                is_mentioned=is_mentioned,
+                history_enabled=self.history_enabled,
+            )
             return None
 
         # Time window (Unix seconds). 0 minutes ⇒ unlimited.
@@ -405,6 +490,12 @@ class Bot:
 
             start_time_seconds = int(_time.time()) - self.history_window_minutes * 60
 
+        log.debug(
+            "history.list_request",
+            chat_id=chat_id,
+            count=self.history_count,
+            start_time_seconds=start_time_seconds,
+        )
         try:
             raw_messages = feishu.list_chat_messages(
                 chat_id,
@@ -412,20 +503,27 @@ class Bot:
                 start_time_seconds=start_time_seconds,
             )
         except feishu.FeishuError as e:
-            print(
-                f"[history] list_chat_messages failed (chat_id={chat_id}): {e}; "
-                "continuing without history",
-                file=sys.stderr,
+            log.warning(
+                "history.list_failed",
+                chat_id=chat_id,
+                error=str(e),
+                action="continuing_without_history",
             )
             return None
         except Exception as e:  # noqa: BLE001
-            print(
-                f"[history] unexpected error loading history: {e}; "
-                "continuing without history",
-                file=sys.stderr,
+            log.exception(
+                "history.list_unexpected_error",
+                chat_id=chat_id,
+                error=str(e),
+                action="continuing_without_history",
             )
             return None
 
+        log.debug(
+            "history.list_response",
+            chat_id=chat_id,
+            raw_count=len(raw_messages) if raw_messages else 0,
+        )
         if not raw_messages:
             return None
 
@@ -451,13 +549,20 @@ class Bot:
             image_bytes_by_key=image_bytes_by_key,
         )
 
+        log.debug(
+            "history.built",
+            chat_id=chat_id,
+            chat_messages=len(result.chat_messages),
+            images_included=result.image_count_included,
+            images_total=result.image_count_total,
+            images_skipped_no_multimodal=result.image_count_skipped_no_multimodal,
+        )
+
         if result.image_count_skipped_no_multimodal > 0:
-            print(
-                f"[history] WARNING: T2T_MULTIMODAL is not enabled; skipped "
-                f"{result.image_count_skipped_no_multimodal} image(s) from "
-                f"conversation history. Set T2T_MULTIMODAL=1 to include "
-                f"historical images in LLM context.",
-                file=sys.stderr,
+            log.warning(
+                "history.images_skipped_no_multimodal",
+                skipped=result.image_count_skipped_no_multimodal,
+                hint="Set T2T_MULTIMODAL=1 to include historical images in LLM context.",
             )
         return result
 
@@ -508,18 +613,31 @@ class Bot:
                         msg_id, key, type_="image"
                     )
                     budget -= 1
+                    log.debug(
+                        "history.image_downloaded",
+                        message_id=msg_id,
+                        image_key=key,
+                        size_bytes=len(downloaded[key]),
+                    )
                 except feishu.FeishuError as e:
-                    print(
-                        f"[history] failed to download history image "
-                        f"(msg={msg_id}, key={key}): {e}; skipping",
-                        file=sys.stderr,
+                    log.warning(
+                        "history.image_download_failed",
+                        message_id=msg_id,
+                        image_key=key,
+                        error=str(e),
                     )
                 except Exception as e:  # noqa: BLE001
-                    print(
-                        f"[history] unexpected error downloading history image: "
-                        f"{e}; skipping",
-                        file=sys.stderr,
+                    log.exception(
+                        "history.image_download_unexpected_error",
+                        message_id=msg_id,
+                        image_key=key,
+                        error=str(e),
                     )
+        log.debug(
+            "history.images_download_summary",
+            downloaded=len(downloaded),
+            budget_remaining=budget,
+        )
         return downloaded
 
     def _resolve_quoted_image(self, parent_id: str
@@ -530,17 +648,26 @@ class Bot:
         On any failure the keys are empty and the error string is set so the
         caller can decide whether to surface it.
         """
+        log.debug("bot.quoted.lookup", parent_id=parent_id)
         try:
             parent_msg = feishu.get_message(parent_id)
         except feishu.FeishuError as e:
+            log.warning(
+                "bot.quoted.parent_get_failed",
+                parent_id=parent_id,
+                error=str(e),
+            )
             return [], parent_id, f"message.get failed for {parent_id}: {e}"
         _, parent_image_keys = _parse_quoted_message(parent_msg)
         if not parent_image_keys:
+            log.debug(
+                "bot.quoted.parent_has_no_image", parent_id=parent_id
+            )
             return [], parent_id, f"quoted message {parent_id} has no image"
-        print(
-            f"[bot] using image from quoted message {parent_id} "
-            f"(key={parent_image_keys[0]})",
-            file=sys.stderr,
+        log.info(
+            "bot.quoted.using_parent_image",
+            parent_id=parent_id,
+            image_key=parent_image_keys[0],
         )
         return parent_image_keys, parent_id, None
 
@@ -554,8 +681,19 @@ class Bot:
                 f"⚠️ 抱歉，处理消息时出错: {short}",
                 uuid=f"{event_id or message_id}:error",
             )
+            log.info(
+                "bot.error_reply_sent",
+                message_id=message_id,
+                event_id=event_id,
+                error_preview=short,
+            )
         except Exception as nested:  # noqa: BLE001
-            print(f"[bot] failed to deliver error reply: {nested}", file=sys.stderr)
+            log.exception(
+                "bot.error_reply_failed",
+                message_id=message_id,
+                event_id=event_id,
+                nested_error=str(nested),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -565,9 +703,10 @@ class Bot:
 def _build_bot_from_env() -> Bot:
     respond_mode = os.environ.get("FEISHU_RESPOND_MODE", DEFAULT_RESPOND_MODE).strip() or DEFAULT_RESPOND_MODE
     if respond_mode not in ("all", "mentions_or_p2p"):
-        print(
-            f"[bot] invalid FEISHU_RESPOND_MODE={respond_mode!r}, falling back to 'all'",
-            file=sys.stderr,
+        log.warning(
+            "bot.invalid_respond_mode",
+            value=respond_mode,
+            fallback="all",
         )
         respond_mode = "all"
     bot_open_id = os.environ.get("FEISHU_BOT_OPEN_ID") or None
@@ -583,6 +722,18 @@ def _build_bot_from_env() -> Bot:
         "FEISHU_HISTORY_MAX_IMAGES", DEFAULT_HISTORY_MAX_IMAGES
     )
     t2t_multimodal = _env_bool("T2T_MULTIMODAL", False)
+    log.debug(
+        "bot.build_from_env",
+        respond_mode=respond_mode,
+        bot_open_id_set=bool(bot_open_id),
+        workers=workers,
+        dedup_capacity=dedup,
+        history_enabled=history_enabled,
+        history_count=history_count,
+        history_window_minutes=history_window_minutes,
+        history_max_images=history_max_images,
+        t2t_multimodal=t2t_multimodal,
+    )
     return Bot(
         respond_mode=respond_mode,
         bot_open_id=bot_open_id,

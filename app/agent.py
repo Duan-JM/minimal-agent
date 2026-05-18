@@ -4,7 +4,6 @@ as a threaded reply in bot mode)."""
 from __future__ import annotations
 
 import os
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +11,10 @@ from typing import Optional, Union
 
 from . import feishu, tools
 from .history import HistoryResult
+from .log_config import get_logger
+
+
+log = get_logger(__name__)
 
 
 VALID_TOOLS = ("t2t", "t2i", "it2t", "it2i")
@@ -148,13 +151,22 @@ def _heuristic_route(prompt: str, has_image: bool) -> str:
     p = (prompt or "").lower()
     if has_image:
         if any(k in p for k in IMAGE_EDIT_KEYWORDS):
-            return "it2i"
-        if any(k in p for k in IMAGE_GEN_KEYWORDS):
-            return "it2i"
-        return "it2t"
-    if any(k in p for k in IMAGE_GEN_KEYWORDS):
-        return "t2i"
-    return "t2t"
+            tool = "it2i"
+        elif any(k in p for k in IMAGE_GEN_KEYWORDS):
+            tool = "it2i"
+        else:
+            tool = "it2t"
+    elif any(k in p for k in IMAGE_GEN_KEYWORDS):
+        tool = "t2i"
+    else:
+        tool = "t2t"
+    log.debug(
+        "router.heuristic.decide",
+        tool=tool,
+        has_image=has_image,
+        prompt_preview=(prompt or "")[:80],
+    )
+    return tool
 
 
 def _llm_route(prompt: str, has_image: bool) -> Optional[str]:
@@ -182,6 +194,12 @@ def _llm_route(prompt: str, has_image: bool) -> Optional[str]:
         "Call the single function that best fits."
     )
 
+    log.debug(
+        "router.llm.request",
+        has_image=has_image,
+        candidates=candidate_names,
+        prompt_preview=(prompt or "")[:80],
+    )
     try:
         data = tools.chat_completion(
             [
@@ -194,63 +212,83 @@ def _llm_route(prompt: str, has_image: bool) -> Optional[str]:
             max_tokens=64,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[router] LLM routing failed, falling back to heuristic: {e}", file=sys.stderr)
+        log.warning(
+            "router.llm.call_failed", error=str(e), fallback="heuristic"
+        )
         return None
 
     try:
         message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
-        print(f"[router] LLM response had no message: {str(data)[:300]!r}", file=sys.stderr)
+        log.warning(
+            "router.llm.no_message", data_preview=str(data)[:300]
+        )
         return None
     if not isinstance(message, dict):
-        print(f"[router] LLM message is not a dict: {type(message).__name__}", file=sys.stderr)
+        log.warning(
+            "router.llm.message_not_dict", type=type(message).__name__
+        )
         return None
 
     tool_calls = message.get("tool_calls")
     if not isinstance(tool_calls, list) or not tool_calls:
-        print(
-            "[router] LLM returned no tool_calls; falling back to heuristic",
-            file=sys.stderr,
+        log.warning(
+            "router.llm.no_tool_calls", fallback="heuristic"
         )
         return None
 
     first = tool_calls[0]
     if not isinstance(first, dict):
-        print(f"[router] LLM tool_calls[0] is not a dict: {first!r}", file=sys.stderr)
+        log.warning("router.llm.tool_call_not_dict", value=repr(first))
         return None
     fn = first.get("function")
     if not isinstance(fn, dict):
-        print(f"[router] LLM tool_calls[0].function is not a dict: {fn!r}", file=sys.stderr)
+        log.warning("router.llm.function_not_dict", value=repr(fn))
         return None
     name = fn.get("name")
     if not isinstance(name, str):
-        print(f"[router] LLM returned non-string function name: {name!r}", file=sys.stderr)
+        log.warning("router.llm.name_not_string", value=repr(name))
         return None
     name = name.strip()
     # Validate against the offered candidates — not the full VALID_TOOLS —
     # so a buggy backend returning an impossible cross-modality tool is
     # surfaced as a routing miss rather than silently remapped.
     if name not in candidate_names:
-        print(
-            f"[router] LLM returned out-of-set tool name: {name!r} "
-            f"(allowed: {candidate_names})",
-            file=sys.stderr,
+        log.warning(
+            "router.llm.out_of_set",
+            name=name,
+            allowed=candidate_names,
         )
         return None
+    log.debug("router.llm.decided", tool=name, candidates=candidate_names)
     return name
 
 
 def route(prompt: str, has_image: bool) -> str:
     tool: Optional[str] = None
-    if os.environ.get("ENABLE_LLM_ROUTER", "").strip() in ("1", "true", "True", "yes"):
+    llm_router_enabled = os.environ.get("ENABLE_LLM_ROUTER", "").strip() in (
+        "1", "true", "True", "yes"
+    )
+    log.debug(
+        "router.start",
+        has_image=has_image,
+        llm_router_enabled=llm_router_enabled,
+        prompt_len=len(prompt or ""),
+    )
+    if llm_router_enabled:
         tool = _llm_route(prompt, has_image)
     if tool is None:
         tool = _heuristic_route(prompt, has_image)
     # Consistency guard against mismatched (mode, has_image).
     if has_image and tool in ("t2t", "t2i"):
-        tool = "it2t" if tool == "t2t" else "it2i"
+        new_tool = "it2t" if tool == "t2t" else "it2i"
+        log.debug("router.coerce_to_image", from_tool=tool, to_tool=new_tool)
+        tool = new_tool
     if (not has_image) and tool in ("it2t", "it2i"):
-        tool = "t2t" if tool == "it2t" else "t2i"
+        new_tool = "t2t" if tool == "it2t" else "t2i"
+        log.debug("router.coerce_to_text", from_tool=tool, to_tool=new_tool)
+        tool = new_tool
+    log.info("router.decided", tool=tool, has_image=has_image)
     return tool
 
 
@@ -262,6 +300,7 @@ def decide_tool(prompt: str, has_image: bool, mode: Optional[str] = None) -> str
             raise ValueError(f"mode={mode} does not accept an image input; use it2t or it2i")
         if (not has_image) and mode in ("it2t", "it2i"):
             raise ValueError(f"mode={mode} requires an image input")
+        log.debug("router.explicit_mode", tool=mode, has_image=has_image)
         return mode
     return route(prompt, has_image)
 
@@ -271,27 +310,51 @@ def execute_tool(tool: str, prompt: str,
                  history: Optional[HistoryResult] = None) -> ToolResult:
     chat_history = history.chat_messages if history else None
     text_prefix = history.text_summary if history else None
-    if tool == "t2t":
-        return ToolResult(tool=tool, text=tools.t2t(prompt, history=chat_history))
-    if tool == "it2t":
-        if image is None:
-            raise ValueError("it2t requires an image input")
-        return ToolResult(
-            tool=tool, text=tools.it2t(image, prompt, history=chat_history)
-        )
-    if tool == "t2i":
-        return ToolResult(
-            tool=tool,
-            image_bytes=tools.t2i(prompt, history_text_prefix=text_prefix),
-        )
-    if tool == "it2i":
-        if image is None:
-            raise ValueError("it2i requires an image input")
-        return ToolResult(
-            tool=tool,
-            image_bytes=tools.it2i(image, prompt, history_text_prefix=text_prefix),
-        )
-    raise ValueError(f"unknown tool {tool!r}")
+    log.debug(
+        "agent.execute_tool.start",
+        tool=tool,
+        has_image=image is not None,
+        history_msgs=len(chat_history) if chat_history else 0,
+        history_text_chars=len(text_prefix) if text_prefix else 0,
+        prompt_len=len(prompt or ""),
+    )
+    started = time.monotonic()
+    try:
+        if tool == "t2t":
+            result = ToolResult(tool=tool, text=tools.t2t(prompt, history=chat_history))
+        elif tool == "it2t":
+            if image is None:
+                raise ValueError("it2t requires an image input")
+            result = ToolResult(
+                tool=tool, text=tools.it2t(image, prompt, history=chat_history)
+            )
+        elif tool == "t2i":
+            result = ToolResult(
+                tool=tool,
+                image_bytes=tools.t2i(prompt, history_text_prefix=text_prefix),
+            )
+        elif tool == "it2i":
+            if image is None:
+                raise ValueError("it2i requires an image input")
+            result = ToolResult(
+                tool=tool,
+                image_bytes=tools.it2i(image, prompt, history_text_prefix=text_prefix),
+            )
+        else:
+            raise ValueError(f"unknown tool {tool!r}")
+    except Exception:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        log.exception("agent.execute_tool.failed", tool=tool, elapsed_ms=elapsed_ms)
+        raise
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    log.info(
+        "agent.execute_tool.done",
+        tool=tool,
+        elapsed_ms=elapsed_ms,
+        text_chars=len(result.text or "") if result.text else 0,
+        image_bytes=len(result.image_bytes) if result.image_bytes else 0,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +368,12 @@ def save_image(image_bytes: bytes, output_dir: Union[str, Path], tool: str,
     ts = time.strftime("%Y%m%d_%H%M%S")
     out = out_dir / f"{ts}_{tool}.{suffix}"
     out.write_bytes(image_bytes)
+    log.debug(
+        "agent.save_image",
+        path=str(out),
+        size_bytes=len(image_bytes),
+        tool=tool,
+    )
     return out
 
 
@@ -325,26 +394,47 @@ def _resolve_chat_id(explicit: Optional[str]) -> Optional[str]:
 
 def _push_text(chat_id: str, text: str, header: str) -> tuple[bool, Optional[str]]:
     body = f"{header}\n\n{text}" if header else text
+    log.debug("agent.push_text", chat_id=chat_id, body_chars=len(body))
     try:
         feishu.send_text(chat_id, body)
+        log.info("agent.push_text.ok", chat_id=chat_id, body_chars=len(body))
         return True, None
     except feishu.FeishuError as e:
-        print(f"[feishu] send failed: {e}", file=sys.stderr)
+        log.error("agent.push_text.failed", chat_id=chat_id, error=str(e))
         return False, str(e)
 
 
 def _push_image(chat_id: str, image_bytes: bytes, prompt: str, tool: str
                 ) -> tuple[bool, Optional[str]]:
+    log.debug(
+        "agent.push_image",
+        chat_id=chat_id,
+        size_bytes=len(image_bytes),
+        tool=tool,
+    )
     try:
         feishu.send_image(chat_id, image_bytes)
     except feishu.FeishuError as e:
-        print(f"[feishu] image send failed: {e}", file=sys.stderr)
+        log.error(
+            "agent.push_image.failed",
+            chat_id=chat_id,
+            error=str(e),
+            tool=tool,
+        )
         return False, str(e)
     try:
         feishu.send_text(chat_id, f"🎨 [{tool}] {prompt}")
     except feishu.FeishuError as e:
         # Image already delivered — caption failure is non-fatal.
-        print(f"[feishu] caption send failed (image already sent): {e}", file=sys.stderr)
+        log.warning(
+            "agent.push_caption.failed",
+            chat_id=chat_id,
+            error=str(e),
+            tool=tool,
+        )
+    log.info(
+        "agent.push_image.ok", chat_id=chat_id, size_bytes=len(image_bytes), tool=tool
+    )
     return True, None
 
 
@@ -359,20 +449,30 @@ def run(prompt: str, image_path: Optional[str] = None, mode: Optional[str] = Non
         raise FileNotFoundError(f"Input image not found: {image_path}")
 
     tool = decide_tool(prompt, has_image, mode)
-    print(f"[agent] tool={tool} has_image={has_image}", file=sys.stderr)
+    log.info(
+        "agent.run.dispatch",
+        tool=tool,
+        has_image=has_image,
+        notify_feishu=notify_feishu,
+        image_path=image_path,
+        prompt_preview=(prompt or "")[:80],
+    )
 
     result = execute_tool(tool, prompt, image_path if has_image else None)
 
     target_chat = _resolve_chat_id(chat_id) if notify_feishu else None
+    if notify_feishu and not target_chat:
+        log.warning("agent.run.no_chat_id_configured")
 
     if result.text is not None:
+        # ``print`` (stdout) is the documented CLI contract — pipes consume
+        # the model's reply directly. Logs stay on stderr.
         print(result.text)
         pushed, err = (False, None)
         if notify_feishu:
             if not target_chat:
                 err = ("FEISHU_CHAT_ID (or --chat-id) is required to deliver "
                        "messages; pass --no-feishu to skip.")
-                print(f"[feishu] {err}", file=sys.stderr)
             else:
                 header = f"💬 [{tool}] {prompt}" if tool == "t2t" else f"🖼️→💬 [{tool}] {prompt}"
                 pushed, err = _push_text(target_chat, result.text, header=header)
@@ -381,13 +481,17 @@ def run(prompt: str, image_path: Optional[str] = None, mode: Optional[str] = Non
 
     assert result.image_bytes is not None
     out = save_image(result.image_bytes, output_dir, tool)
-    print(f"[agent] image saved: {out} ({len(result.image_bytes)} bytes)", file=sys.stderr)
+    log.info(
+        "agent.run.image_saved",
+        path=str(out),
+        size_bytes=len(result.image_bytes),
+        tool=tool,
+    )
     pushed, err = (False, None)
     if notify_feishu:
         if not target_chat:
             err = ("FEISHU_CHAT_ID (or --chat-id) is required to deliver "
                    "messages; pass --no-feishu to skip.")
-            print(f"[feishu] {err}", file=sys.stderr)
         else:
             pushed, err = _push_image(target_chat, result.image_bytes, prompt, tool)
     return AgentResult(tool=tool, image_path=str(out),
@@ -427,17 +531,18 @@ def handle_feishu_event(
 
     prompt = text.strip() if text else DEFAULT_IMAGE_ONLY_PROMPT
     tool = decide_tool(prompt, has_image, mode)
-    history_info = ""
-    if history and history.has_content:
-        history_info = (
-            f" history_msgs={len(history.chat_messages)}"
-            f" history_imgs={history.image_count_included}"
-            f"/{history.image_count_total}"
-        )
-    print(
-        f"[agent] feishu event tool={tool} has_image={has_image} chat_id={chat_id} "
-        f"msg={message_id} event={event_id}{history_info}",
-        file=sys.stderr,
+    log.info(
+        "agent.feishu_event.dispatch",
+        tool=tool,
+        has_image=has_image,
+        chat_id=chat_id,
+        message_id=message_id,
+        event_id=event_id,
+        history_msgs=len(history.chat_messages) if history else 0,
+        history_imgs_included=history.image_count_included if history else 0,
+        history_imgs_total=history.image_count_total if history else 0,
+        prompt_chars=len(prompt or ""),
+        image_bytes=len(image_bytes) if image_bytes else 0,
     )
 
     result = execute_tool(tool, prompt, image_bytes if has_image else None,
@@ -446,13 +551,41 @@ def handle_feishu_event(
     uuid = _make_uuid(event_id, message_id, tool)
 
     if result.text is not None:
+        log.debug(
+            "agent.feishu_event.reply_text",
+            message_id=message_id,
+            chars=len(result.text),
+            tool=tool,
+            uuid=uuid,
+        )
         feishu.reply_text(message_id, result.text, uuid=uuid)
+        log.info(
+            "agent.feishu_event.replied",
+            tool=tool,
+            message_id=message_id,
+            kind="text",
+            chars=len(result.text),
+        )
         return result
 
     assert result.image_bytes is not None
     if save_image_locally:
         out = save_image(result.image_bytes, output_dir, tool)
         result.image_path = str(out)
+    log.debug(
+        "agent.feishu_event.reply_image",
+        message_id=message_id,
+        size_bytes=len(result.image_bytes),
+        tool=tool,
+        uuid=uuid,
+    )
     feishu.reply_image(message_id, result.image_bytes, uuid=uuid)
+    log.info(
+        "agent.feishu_event.replied",
+        tool=tool,
+        message_id=message_id,
+        kind="image",
+        size_bytes=len(result.image_bytes),
+    )
     return result
 

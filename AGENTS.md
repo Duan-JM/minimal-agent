@@ -141,7 +141,8 @@ back-compat shim that rewrites `minimal-agent "prompt"` to
   `FEISHU_WORKER_THREADS`, `FEISHU_DEDUP_CAPACITY`,
   `FEISHU_HISTORY_ENABLED`, `FEISHU_HISTORY_COUNT`,
   `FEISHU_HISTORY_WINDOW_MINUTES`, `FEISHU_HISTORY_MAX_IMAGES`,
-  `OUTPUT_DIR`, `ENABLE_LLM_ROUTER`, `LLM_TIMEOUT`.
+  `OUTPUT_DIR`, `ENABLE_LLM_ROUTER`, `LLM_TIMEOUT`,
+  `LOG_LEVEL`, `LOG_FORMAT`.
 - **No persistent storage**: no database, no cache, no broker. State is
   in-process (LRU dedup set, thread pool).
 - **Service architecture**:
@@ -153,9 +154,20 @@ back-compat shim that rewrites `minimal-agent "prompt"` to
 - **Background / async work**: the SDK’s asyncio receive loop must stay
   responsive, so all LLM/image work is offloaded to a bounded
   `ThreadPoolExecutor` (`FEISHU_WORKER_THREADS`, default 4).
-- **Logging**: standard library + `lark_oapi`’s own logger. Set
-  `FEISHU_DEBUG=1` for verbose SDK logs. Do not introduce a new logging
-  framework as a side effect.
+- **Logging**: `structlog` (configured once at CLI startup in
+  `app/log_config.py`) with `lark_oapi`'s own logger left untouched.
+  All `app/*` modules call `get_logger(__name__)` and emit structured
+  events (e.g. `bot.message_received`, `agent.execute_tool.done`,
+  `tools.chat.http_error`). Output goes to **stderr** so `run` CLI
+  results on stdout stay pipe-clean. Tune via `LOG_LEVEL` (default
+  `INFO`) and `LOG_FORMAT` (`auto`/`console`/`json`). Legacy
+  `FEISHU_DEBUG=1` still works as a shortcut for `LOG_LEVEL=DEBUG`
+  plus verbose SDK logs. **Never call `print(...)` for logging in
+  `app/` code** — the only allowed `print` calls are stdout output
+  for the `run` subcommand (CLI contract) and user-facing CLI errors
+  in `__main__.py`. Use `log.<level>("event.name", key=val, ...)`
+  with namespaced event names (`bot.*`, `agent.*`, `router.*`,
+  `tools.*`, `feishu.*`, `history.*`, `messages.*`).
 - **Error handling**: `tools.py` raises `RuntimeError` / `ValueError` on bad
   responses; `feishu.py` raises `FeishuError`. The bot handler wraps worker
   exceptions and sends a best-effort short error reply so users aren’t left

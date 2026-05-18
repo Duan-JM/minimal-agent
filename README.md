@@ -179,7 +179,9 @@ if present). See `.env.example`.
 | `FEISHU_BOT_OPEN_ID` | — | Required for `mentions_or_p2p` *and* for reliable history loading in groups (used to detect bot @-mentions). |
 | `FEISHU_WORKER_THREADS` | `4` | Worker pool size for LLM calls. |
 | `FEISHU_DEDUP_CAPACITY` | `1024` | LRU size for `event_id` dedup. |
-| `FEISHU_DEBUG` | — | Set to `1` for verbose SDK logs. |
+| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `LOG_FORMAT` | `auto` | `console` (human-readable, colored if TTY), `json` (one-line, log-aggregator friendly), or `auto` (console on TTY, JSON otherwise). |
+| `FEISHU_DEBUG` | — | Legacy alias. Set to `1` to force `LOG_LEVEL=DEBUG` *and* enable verbose lark_oapi SDK logs. |
 
 ### Conversation history (optional)
 | Var | Default | Purpose |
